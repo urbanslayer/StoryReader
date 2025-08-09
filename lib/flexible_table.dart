@@ -88,6 +88,9 @@ class _FlexibleTableRenderObject extends RenderBox
             skip[currentRow + y].add(_Skip(currentCol, c.colSpan, c, y == c.rowSpan - 1, rowHeight));
           }
         }
+        if (c.colSpan > 1 && c.rowSpan == 1) {
+          skip[currentRow].add(_Skip(currentCol, c.colSpan, c, true, rowHeight));
+        }
         double leftoverX = colSize * c.colSpan - c.size.width;
         double leftoverY = rowHeight - c.size.height;
         (c.parentData as BoxParentData).offset = Offset(currentX + leftoverX / 2 + c.align.x * (leftoverX / 2),
@@ -113,16 +116,29 @@ class _FlexibleTableRenderObject extends RenderBox
       p.color = borderColor!;
       var tableHeight = rowHeights.sum;
       var tableWidth = colSize * cols;
-      for (int i = 0; i <= cols; i++) {
-        var start = offset + Offset(colSize * i, 0);
-        context.canvas.drawLine(start, start + Offset(0, tableHeight), p);
-      }
       context.canvas.drawLine(offset, offset + Offset(tableWidth, 0), p);
+      context.canvas.drawLine(offset, offset + Offset(0, tableHeight), p);
       double height = 0;
       for (int r = 0; r < rows.length; r++) {
         height += rowHeights[r];
         var start = offset + Offset(0, height);
-        context.canvas.drawLine(start, start + Offset(tableWidth, 0), p);
+        for (int col = 0; col < cols; col++) {
+          var sk = skip[r].firstWhereOrNull((s) => s.col == col);
+          if (sk != null) {
+            var s = start + Offset(colSize * col, 0);
+            if (sk.last) {
+              context.canvas.drawLine(s, s + Offset(colSize * sk.num, 0), p);
+            }
+            s = s + Offset(colSize * sk.num, 0);
+            context.canvas.drawLine(s, s + Offset(0, -rowHeights[r]), p);
+            col += sk.num-1;
+            continue;
+          }
+          var s = start + Offset(colSize*col, 0);
+          context.canvas.drawLine(s, s + Offset(colSize, 0), p);
+          s = s + Offset(colSize, 0);
+          context.canvas.drawLine(s, s + Offset(0, -rowHeights[r]), p);
+        }
       }
     }
   }
