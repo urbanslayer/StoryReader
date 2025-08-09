@@ -46,6 +46,7 @@ A reader and offline library for ScribbleHub series.
     - [x] Dividers
     - [x] Images
     - [x] Tables
+    - [ ] Spoilers
     - [ ] Other styling options
     - [ ] Polls
 - [ ] Library import via site account
@@ -67,6 +68,7 @@ A reader and offline library for ScribbleHub series.
 - [x] License page
 - [ ] Merge library from network (keep all data, only add)
 - [x] remove flatpak audio permission
+- [ ] Fix lines over multi-cell cells in tables
 - [ ] migrate contents to RichTextElement
   - [x] consume RichTextDocument in read_page, generate in APIs
   - [x] DB migration

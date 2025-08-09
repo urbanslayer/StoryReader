@@ -1,3 +1,4 @@
+import 'package:collection/collection.dart';
 import 'package:json_annotation/json_annotation.dart';
 import 'package:html/dom.dart' as dom;
 
@@ -9,6 +10,43 @@ sealed class RichTextElement {
   Map<String, dynamic> toJson();
   
   void visit(void Function(RichTextElement) f);
+  
+  bool breakingElement() {
+    switch (this) {
+      case RichTextText():
+        return false;
+      case RichTextSpan():
+        return getChildren().lastOrNull?.breakingElement() ?? false;
+      case RichTextParagraph():
+        return true;
+      case RichTextBreak():
+        return true;
+      case RichTextCodeBlock():
+        return getChildren().lastOrNull?.breakingElement() ?? false;
+      case RichTextCursive():
+        return getChildren().lastOrNull?.breakingElement() ?? false;
+      case RichTextBold():
+        return getChildren().lastOrNull?.breakingElement() ?? false;
+      case RichTextTable():
+        return true;
+      case RichTextLink():
+        return getChildren().lastOrNull?.breakingElement() ?? false;
+      case RichTextImage():
+        return true;
+      case RichTextAnnouncement():
+        return true;
+      case RichTextAuthorNote():
+        return true;
+      case RichTextDivider():
+        return true;
+      case RichTextFootnoteReference():
+        return false;
+    }
+  }
+  
+  List<RichTextElement> getChildren();
+  
+  
 }
 
 
@@ -29,6 +67,11 @@ final class RichTextText extends RichTextElement {
   @override
   void visit(void Function(RichTextElement p1) f) {
     f(this);
+  }
+
+  @override
+  List<RichTextElement> getChildren() {
+    return [];
   }
   
 }
@@ -54,6 +97,11 @@ final class RichTextSpan extends RichTextElement {
       c.visit(f);
     }
   }
+
+  @override
+  List<RichTextElement> getChildren() {
+    return children;
+  }
 }
 
 @JRTE
@@ -77,6 +125,11 @@ final class RichTextParagraph extends RichTextElement {
       c.visit(f);
     }
   }
+
+  @override
+  List<RichTextElement> getChildren() {
+    return children;
+  }
 }
 
 
@@ -93,7 +146,11 @@ final class RichTextBreak extends RichTextElement {
   void visit(void Function(RichTextElement p1) f) {
     f(this);
   }
-  
+
+  @override
+  List<RichTextElement> getChildren() {
+    return [];
+  }
 }
 
 @JRTE
@@ -116,6 +173,11 @@ final class RichTextCodeBlock extends RichTextElement {
     for (var c in children) {
       c.visit(f);
     }
+  }
+
+  @override
+  List<RichTextElement> getChildren() {
+    return children;
   }
 }
 
@@ -141,6 +203,11 @@ final class RichTextCursive extends RichTextElement {
       c.visit(f);
     }
   }
+
+  @override
+  List<RichTextElement> getChildren() {
+    return children;
+  }
 }
 
 @JRTE
@@ -164,6 +231,11 @@ final class RichTextBold extends RichTextElement {
       c.visit(f);
     }
   }
+
+  @override
+  List<RichTextElement> getChildren() {
+    return children;
+  }
 }
 
 @JRTE
@@ -186,6 +258,11 @@ final class RichTextTable extends RichTextElement {
     for (var c in cells) {
       c.child.visit(f);
     }
+  }
+
+  @override
+  List<RichTextElement> getChildren() {
+    return cells.map((c) => c.child).toList();
   }
 }
 
@@ -213,6 +290,11 @@ final class RichTextLink extends RichTextElement {
       c.visit(f);
     }
   }
+
+  @override
+  List<RichTextElement> getChildren() {
+    return children;
+  }
 }
 
 @JsonSerializable()
@@ -235,6 +317,11 @@ final class RichTextImage extends RichTextElement {
   @override
   void visit(void Function(RichTextElement p1) f) {
     f(this);
+  }
+
+  @override
+  List<RichTextElement> getChildren() {
+    return [];
   }
 }
 
@@ -262,6 +349,11 @@ final class RichTextAnnouncement extends RichTextElement {
       c.visit(f);
     }
   }
+
+  @override
+  List<RichTextElement> getChildren() {
+    return children;
+  }
 }
 
 @JRTE
@@ -285,6 +377,11 @@ final class RichTextAuthorNote extends RichTextElement {
       c.visit(f);
     }
   }
+
+  @override
+  List<RichTextElement> getChildren() {
+    return children;
+  }
 }
 
 
@@ -300,6 +397,11 @@ final class RichTextDivider extends RichTextElement {
   @override
   void visit(void Function(RichTextElement p1) f) {
     f(this);
+  }
+
+  @override
+  List<RichTextElement> getChildren() {
+    return [];
   }
 }
 
@@ -323,6 +425,11 @@ final class RichTextFootnoteReference extends RichTextElement {
   void visit(void Function(RichTextElement p1) f) {
     f(this);
   }
+
+  @override
+  List<RichTextElement> getChildren() {
+    return [];
+  }
 }
 
 @JRTE
@@ -342,6 +449,7 @@ final class RichTextDocument {
     footnotes = [];
     imageSources = [];
     document = nodes.map((e) => toRTE(e).$1).toList();
+    addSpacing();
   }
 
   (List<RichTextElement>, bool) nodesToRTE(dom.NodeList nl, [bool paragraphBreaks = true]) {
@@ -349,7 +457,7 @@ final class RichTextDocument {
     return (c.map((e) => e.$1).toList(), c.map((e) => e.$2).any((e) => e));
   }
   
-  (RichTextElement, bool) toRTE(dom.Node n, [bool paragraphBreaks = true, bool trim = false]) {
+  (RichTextElement, bool) toRTE(dom.Node n, [bool paragraphBreaks = true]) {
     if (n is dom.Element) {
       Lazy<(List<RichTextElement>, bool)> c = Lazy(() => nodesToRTE(n.nodes, paragraphBreaks));
       switch (n.localName) {
@@ -359,9 +467,9 @@ final class RichTextDocument {
           return (RichTextDivider(), false);
         case "br":
           if (paragraphBreaks) {
-            return (RichTextText("\n"), false);
+            return (RichTextBreak(), false);
           } else {
-            return (RichTextText(""), false);
+            return (RichTextBreak(), false);
           }
         case "strong":
           return (RichTextBold(c.v.$1), c.v.$2);
@@ -403,6 +511,18 @@ final class RichTextDocument {
             }
           }
           return (RichTextTable(cells), false);
+        case "ul":
+          List<RichTextElement> children = [];
+          for (var c in n.children) {
+            children.add(RichTextSpan([RichTextText("●"), toRTE(c).$1, RichTextBreak()]));
+          }
+          return (RichTextParagraph(children), false);
+        case "ol":
+          List<RichTextElement> children = [];
+          for (var (i, c) in n.children.indexed) {
+            children.add(RichTextSpan([RichTextText("$i."), toRTE(c).$1, RichTextBreak()]));
+          }
+          return (RichTextParagraph(children), false);
         case "p":
         case "div":
         case "td":
@@ -448,6 +568,102 @@ final class RichTextDocument {
     }
     for (var c in document) {
       c.visit(fn);
+    }
+  }
+  
+  void addSpacing() {
+    void inner(RichTextElement e, int index, List<RichTextElement> siblings, bool paragraphStart) {
+      switch (e) {
+        case RichTextText():
+          if (e.content == "\n") {
+            siblings[index] = RichTextBreak();
+            break;
+          }
+          bool needsSpace;
+          if (index != 0) {
+            needsSpace = ! siblings[index-1].breakingElement();
+          } else {
+            needsSpace = ! paragraphStart;
+          }
+          if (needsSpace) {
+            e.content = " ${e.content}";
+          }
+          break;
+        case RichTextSpan():
+          bool p = paragraphStart;
+          for (var (i, c) in e.children.indexed) {
+            inner(c, i, e.children, p);
+            p = c.breakingElement();
+          }
+          break;
+        case RichTextParagraph():
+          bool p = true;
+          for (var (i, c) in e.children.indexed) {
+            inner(c, i, e.children, p);
+            p = c.breakingElement();
+          }
+          break;
+        case RichTextBreak():
+          break;
+        case RichTextCodeBlock():
+          bool p = paragraphStart;
+          for (var (i, c) in e.children.indexed) {
+            inner(c, i, e.children, p);
+            p = c.breakingElement();
+          }
+          break;
+        case RichTextCursive():
+          bool p = paragraphStart;
+          for (var (i, c) in e.children.indexed) {
+            inner(c, i, e.children, p);
+            p = c.breakingElement();
+          }
+          break;
+        case RichTextBold():
+          bool p = paragraphStart;
+          for (var (i, c) in e.children.indexed) {
+            inner(c, i, e.children, p);
+            p = c.breakingElement();
+          }
+          break;
+        case RichTextTable():
+          for (var c in e.cells) {
+            inner(c.child, 0, [c.child], true);
+          }
+        case RichTextLink():
+          bool p = paragraphStart;
+          for (var (i, c) in e.children.indexed) {
+            inner(c, i, e.children, p);
+            p = c.breakingElement();
+          }
+          break;
+        case RichTextImage():
+          break;
+        case RichTextAnnouncement():
+          bool p = true;
+          for (var (i, c) in e.children.indexed) {
+            inner(c, i, e.children, p);
+            p = c.breakingElement();
+          }
+          break;
+        case RichTextAuthorNote():
+          bool p = true;
+          for (var (i, c) in e.children.indexed) {
+            inner(c, i, e.children, p);
+            p = c.breakingElement();
+          }
+          break;
+        case RichTextDivider():
+          break;
+        case RichTextFootnoteReference():
+          break;
+      }
+    }
+    for (var (i, f) in footnotes.indexed) {
+      inner(f, i, footnotes, true);
+    }
+    for (var (i, c) in document.indexed) {
+      inner(c, i, document, true);
     }
   }
   

@@ -160,9 +160,15 @@ Future<InlineSpan> richTextElementToSpan(RichTextElement e, BuildContext context
         return WidgetSpan(
             child: Padding(
           padding: EdgeInsets.symmetric(vertical: style.fontSize! / 2.0),
-          child: Text.rich(TextSpan(
-              children: await Future.wait(e.children.map((c) async => await richTextElementToSpan(c, context, style,
-                  chapter, paragraphBreaks)).toList()))),
+          child: 
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text.rich(TextSpan(
+                    children: await Future.wait(e.children.map((c) async => await richTextElementToSpan(c, context, style,
+                        chapter, paragraphBreaks)).toList()))),
+              ],
+            ),
         ));
       }
       return TextSpan(

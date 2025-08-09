@@ -72,7 +72,7 @@ class ChapterImages extends Table {
   IntColumn get id => integer().autoIncrement()();
   TextColumn get url => text().unique()();
   BlobColumn get image => blob().nullable()();
-  BoolColumn get shouldDownload => boolean()();
+  BoolColumn get shouldDownload => boolean().withDefault(Constant(true))();
   
   @override
   String? get tableName => "images";
@@ -113,7 +113,7 @@ class AppDB extends _$AppDB {
   RichTextDocument? chapterContents(Chapter c) {
     if (c.content != null) {
       var data = _utf8.decoder.convert(_gzip.decoder.convert(c.content!));
-      //File("chapter-dump.json").writeAsString(data);
+      //File("chapter-dump.json").writeAsString(JsonEncoder.withIndent("  ").convert(jsonDecode(data)));
       return RichTextDocument.fromJson(jsonDecode(data));
     }
     return null;
@@ -172,7 +172,7 @@ class AppDB extends _$AppDB {
       if (i != null) {
         return i.id;
       }
-      await into(chapterImages).insert(ChapterImagesCompanion.insert(url: url, shouldDownload: true));
+      await into(chapterImages).insert(ChapterImagesCompanion.insert(url: url, shouldDownload: Value(true)));
       return (await (select(chapterImages)..where((i) => i.url.equals(url))).getSingle()).id;
     });
   }
@@ -350,7 +350,7 @@ class AppDB extends _$AppDB {
   Future<void> saveChapter(Site site, String id, int number, String chapterID, RichTextDocument contents, String name) {
     return transaction(() async {
       var imageIDS = await Future.wait(contents.imageSources.map((url) => addImage(url.toString())).toList());
-      print(imageIDS);
+      //print(imageIDS);
       contents.rewriteImageIndices(imageIDS);
       var c =
         Chapter(site: site, id: id, number: number, queued: false,
@@ -467,7 +467,7 @@ class AppDB extends _$AppDB {
   }
 
   @override
-  int get schemaVersion => 7;
+  int get schemaVersion => 8;
 
   @override
   MigrationStrategy get migration {
@@ -502,6 +502,20 @@ class AppDB extends _$AppDB {
       }
       if (from < 7) {
         await m.addColumn(chapterImages, chapterImages.shouldDownload);
+      }
+      if (from == 6 || from == 7) {
+        var cs = await Future.wait((await select(chapters).get()).map((c) async {
+          if (c.content != null) {
+            var content = _utf8.decode(_gzip.decode(c.content!));
+            var rtd = RichTextDocument.fromJson(jsonDecode(content));
+            rtd.addSpacing();
+            return c.copyWith(content: Value(Uint8List.fromList(_gzip.encode(_utf8.encode(jsonEncode(rtd.toJson()))))));
+          }
+          return c;
+        }).toList());
+        await batch((b) {
+          b.replaceAll(chapters, cs);
+        });
       }
       if (from < 6) {
         var cs = await Future.wait((await select(chapters).get()).map((c) async {
