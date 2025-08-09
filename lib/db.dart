@@ -467,7 +467,7 @@ class AppDB extends _$AppDB {
   }
 
   @override
-  int get schemaVersion => 8;
+  int get schemaVersion => 9;
 
   @override
   MigrationStrategy get migration {
@@ -524,6 +524,25 @@ class AppDB extends _$AppDB {
             var rtd = RichTextDocument.html(parseFragment(content).nodes);
             var imageIDS = await Future.wait(rtd.imageSources.map((url) => addImage(url.toString())).toList());
             rtd.rewriteImageIndices(imageIDS);
+            return c.copyWith(content: Value(Uint8List.fromList(_gzip.encode(_utf8.encode(jsonEncode(rtd.toJson()))))));
+          }
+          return c;
+        }).toList());
+        await batch((b) {
+          b.replaceAll(chapters, cs);
+        });
+      }
+      if (from < 9) {
+        var cs = await Future.wait((await select(chapters).get()).map((c) async {
+          if (c.content != null) {
+            var content = _utf8.decode(_gzip.decode(c.content!));
+            var rtd = RichTextDocument.fromJson(jsonDecode(content));
+            rtd.visit((e) {
+              if (e is RichTextText) {
+                e.content = e.content.trim();
+              }
+            });
+            rtd.addSpacing();
             return c.copyWith(content: Value(Uint8List.fromList(_gzip.encode(_utf8.encode(jsonEncode(rtd.toJson()))))));
           }
           return c;

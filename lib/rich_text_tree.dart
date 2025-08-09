@@ -585,8 +585,14 @@ final class RichTextDocument {
           } else {
             needsSpace = ! paragraphStart;
           }
-          if (needsSpace) {
-            e.content = " ${e.content}";
+          if (e.content.isNotEmpty) {
+            // Insert no space when no word character is the start, as punctuation doesn't need a leading space.
+            if (e.content.startsWith(RegExp(r"\W", unicode: true))) {
+              needsSpace = false;
+            }
+            if (needsSpace) {
+              e.content = " ${e.content}";
+            }
           }
           break;
         case RichTextSpan():
