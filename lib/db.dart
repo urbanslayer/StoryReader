@@ -467,7 +467,7 @@ class AppDB extends _$AppDB {
   }
 
   @override
-  int get schemaVersion => 9;
+  int get schemaVersion => 10;
 
   @override
   MigrationStrategy get migration {
@@ -532,7 +532,7 @@ class AppDB extends _$AppDB {
           b.replaceAll(chapters, cs);
         });
       }
-      if (from < 9) {
+      if (from < 10) {
         var cs = await Future.wait((await select(chapters).get()).map((c) async {
           if (c.content != null) {
             var content = _utf8.decode(_gzip.decode(c.content!));

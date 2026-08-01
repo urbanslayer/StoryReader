@@ -1,0 +1,9 @@
+- First F-Droid release
+- Compressed chapter data
+- Parsed text format instead of raw HTML in the DB. Slightly better compression, and enables easier implementation of saved images
+- Images in chapters are now saved as well
+- Tables are implemented well-enough
+- Fixes for small-screen layouts (like phones)
+- Buttons to compact the DB and delete all images
+- Custom color theme
+- Fixed text colort in light mode
