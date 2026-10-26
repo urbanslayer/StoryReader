@@ -1,5 +1,12 @@
 # Expansion plan
 
+> **Status (2026-10-26, branch `feat/stable-chapter-identity`):** M1, minimal M2 (read marks),
+> M3 (EPUB export) implemented, 131 hermetic tests green, release APK builds. Also done: ScribbleHub
+> chapters fetched through an Android WebView (Cloudflare now challenges every non-browser
+> client), own applicationId `io.github.urbanslayer.storyreader` ("StoryReader+"), import of an
+> upstream v10 library over the network share. Pending on-device verification. RoyalRoad deferred
+> (Anubis bot wall).
+
 Two features: (1) stable chapter identity so an author deleting a chapter does not shuffle the
 library or lose reading position, and (2) EPUB export of the next N unread chapters.
 
