@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:story_reader/db.dart';
 import 'package:story_reader/epub/export_service.dart';
 import 'package:story_reader/main.dart';
+import 'package:story_reader/pages/chapter_display.dart';
 import 'package:story_reader/prefs.dart';
 import 'package:story_reader/series_data.dart';
 
@@ -113,10 +114,16 @@ class _SeriesPageState extends State<SeriesPage> {
                         ChapterUpstreamState.upstream => null,
                       };
                       var label = Text(c.name, softWrap: true);
+                      // Leading fixed-width book chapter number (never the
+                      // legacy `number` slot / TOC index).
+                      var shownNumber = displayChapterNumber(c.name, c.chapterNumber);
                       return Padding(
                         padding: const EdgeInsets.symmetric(horizontal: 8.0),
                         child: Row(
                           children: [
+                            if (shownNumber != null)
+                              Opacity(opacity: c.isRead ? 0.5 : 1.0,
+                                  child: ChapterNumberPrefix(shownNumber)),
                             Flexible(
                               fit: FlexFit.tight,
                               flex: 3,

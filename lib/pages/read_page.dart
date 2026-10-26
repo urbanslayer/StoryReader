@@ -9,6 +9,7 @@ import 'package:html/parser.dart';
 import 'package:html/dom.dart' as dom;
 import 'package:story_reader/db.dart';
 import 'package:story_reader/main.dart';
+import 'package:story_reader/pages/chapter_display.dart';
 import 'package:story_reader/prefs.dart';
 import 'package:story_reader/rich_text_tree.dart';
 import 'package:story_reader/series_data.dart';
@@ -117,19 +118,36 @@ class _ReadPageState extends State<ReadPage> {
               slivers: [
                 SliverAppBar(
                   pinned: true,
-                  title: Row(
-                    children: [
-                      ElevatedButton(onPressed: () => _go(false), child: Text("Previous")),
-                      Flexible(
-                        fit: FlexFit.tight,
-                        child: Center(
-                            child: Text(widget.chapter.name,
-                                softWrap: true, style: const TextStyle(fontSize: 26))),
-                      ),
-                      ElevatedButton(onPressed: () => _goNext(), child: Text("Next")),
-                    ],
+                  leading: IconButton(
+                    icon: const Icon(Icons.chevron_left),
+                    tooltip: "Previous chapter",
+                    onPressed: () => _go(false),
+                  ),
+                  actions: [
+                    IconButton(
+                      icon: const Icon(Icons.chevron_right),
+                      tooltip: "Next chapter",
+                      onPressed: _goNext,
+                    ),
+                  ],
+                  title: ChapterAppBarTitle(
+                    name: widget.chapter.name,
+                    chapterNumber: widget.chapter.chapterNumber,
+                    onTap: () => ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                          content: Text(widget.chapter.name),
+                          duration: const Duration(seconds: 4)),
+                    ),
                   ),
                 ),
+                SliverList.list(children: [
+                  // Full chapter title as a wrapping heading, so the whole
+                  // name is always readable even when the app bar label is
+                  // compact.
+                  ChapterHeading(
+                      name: widget.chapter.name,
+                      chapterNumber: widget.chapter.chapterNumber),
+                ]),
                 d.data!,
                 SliverList.list(children: [
                   ElevatedButton(onPressed: () => _goNext(), child: Text("Next")),

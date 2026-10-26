@@ -106,4 +106,61 @@ void main() {
       expect(parseChapterNumber("4th Chapter"), isNull);
     });
   });
+
+  group('chapterShortLabel', () {
+    test('word-number titles compact to "Chapter N"', () {
+      expect(
+          chapterShortLabel(
+              "Seven Hundred And Twenty-One – Contains Status- Ginneka 2, Eri 11?",
+              721),
+          "Chapter 721");
+      expect(chapterShortLabel("Five Hundred and Seventy-Eight", 578),
+          "Chapter 578");
+      // Number not stored (older rows): parsed from the title.
+      expect(chapterShortLabel("Five Hundred and Seventy-Eight", null),
+          "Chapter 578");
+    });
+
+    test('digit titles', () {
+      expect(chapterShortLabel("Chapter 12: Foo", 12), "Chapter 12");
+      expect(chapterShortLabel("578 - Bar", null), "Chapter 578");
+    });
+
+    test('unparseable titles keep their name', () {
+      expect(chapterShortLabel("Prologue", null), "Prologue");
+      expect(chapterShortLabel("Interlude – Something", null),
+          "Interlude – Something");
+    });
+
+    test('stored number wins even if the title was renamed', () {
+      expect(chapterShortLabel("Renamed Upstream Title", 721), "Chapter 721");
+    });
+  });
+
+  group('chapterSubtitle', () {
+    test('text after the number words and separator', () {
+      expect(
+          chapterSubtitle(
+              "Seven Hundred And Twenty-One – Contains Status- Ginneka 2, Eri 11?",
+              721),
+          "Contains Status- Ginneka 2, Eri 11?");
+      expect(chapterSubtitle("Chapter 12: Foo", 12), "Foo");
+      expect(chapterSubtitle("578 - Bar", 578), "Bar");
+      expect(chapterSubtitle("Twelve - Interlude", null), "Interlude");
+      expect(chapterSubtitle("Chapter One More Thing", null), "More Thing");
+    });
+
+    test('null when the title is only the number', () {
+      expect(chapterSubtitle("Five Hundred and Seventy-Eight", 578), isNull);
+      expect(chapterSubtitle("578", 578), isNull);
+      expect(chapterSubtitle("Chapter Twelve", 12), isNull);
+    });
+
+    test('null when no number is parseable from the title', () {
+      expect(chapterSubtitle("Prologue", null), isNull);
+      expect(chapterSubtitle("Interlude – Something", null), isNull);
+      // Stored number but renamed title: no split point exists.
+      expect(chapterSubtitle("Renamed Upstream Title", 721), isNull);
+    });
+  });
 }

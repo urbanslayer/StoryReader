@@ -58,7 +58,43 @@ const Map<String, int> _tens = {
 ///
 /// Handles, e.g.: `Chapter 578 - Title`, `578: Title`, `578 - Title`,
 /// `Five Hundred and Seventy-Eight`, `Chapter Twelve: Something`.
-int? parseChapterNumber(String title) {
+int? parseChapterNumber(String title) => _parseNumberWithEnd(title)?.$1;
+
+/// A compact on-screen label for a chapter: "Chapter 721" when the book's own
+/// number is known (preferring the stored [chapterNumber], falling back to
+/// parsing [name]), otherwise the title itself.
+String chapterShortLabel(String name, int? chapterNumber) {
+  final n = chapterNumber ?? parseChapterNumber(name);
+  return n == null ? name.trim() : 'Chapter $n';
+}
+
+/// The part of the title *after* the leading chapter number and separator,
+/// e.g. "Contains Status- Ginneka 2, Eri 11?" for
+/// "Seven Hundred And Twenty-One – Contains Status- Ginneka 2, Eri 11?".
+///
+/// Returns null when the title carries no parseable number or is *only* the
+/// number. The split point must come from the title itself: a stored number
+/// whose title no longer starts with it (renamed upstream) yields no subtitle.
+String? chapterSubtitle(String name, int? chapterNumber) {
+  final parsed = _parseNumberWithEnd(name);
+  if (parsed == null) {
+    return null;
+  }
+  var rest = name.trim().substring(parsed.$2).trim();
+  if (rest.isEmpty) {
+    return null;
+  }
+  final sep = _separator.matchAsPrefix(rest);
+  if (sep != null) {
+    rest = rest.substring(sep.end).trim();
+  }
+  return rest.isEmpty ? null : rest;
+}
+
+/// [parseChapterNumber] plus the character count of the trimmed title
+/// consumed by the number (keyword + digits/words), so callers can find the
+/// subtitle boundary. Returns `(value, endOffset)` or null.
+(int, int)? _parseNumberWithEnd(String title) {
   final trimmed = title.trim();
   if (trimmed.isEmpty) {
     return null;
@@ -66,7 +102,8 @@ int? parseChapterNumber(String title) {
 
   final keyword = _leadingKeyword.matchAsPrefix(trimmed);
   final hasKeyword = keyword != null;
-  final rest = hasKeyword ? trimmed.substring(keyword.end) : trimmed;
+  final offset = keyword?.end ?? 0;
+  final rest = trimmed.substring(offset);
   if (rest.isEmpty) {
     return null;
   }
@@ -74,7 +111,7 @@ int? parseChapterNumber(String title) {
   // Digits right at the front: "578: Title", "578 - Title", "Chapter 578".
   final digits = _leadingDigits.matchAsPrefix(rest);
   if (digits != null) {
-    return int.parse(digits.group(1)!);
+    return (int.parse(digits.group(1)!), offset + digits.end);
   }
 
   // Word number at the front: "Five Hundred and Seventy-Eight",
@@ -98,7 +135,7 @@ int? parseChapterNumber(String title) {
       return null;
     }
   }
-  return value;
+  return (value, offset + tokens[consumed - 1].end);
 }
 
 /// Greedy word-number grammar for 0..9999:

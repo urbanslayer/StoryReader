@@ -1,9 +1,11 @@
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:story_reader/chapter_number.dart';
 import 'package:story_reader/db.dart';
 import 'package:story_reader/download_manager.dart';
 import 'package:story_reader/main.dart';
+import 'package:story_reader/pages/chapter_display.dart';
 import 'package:story_reader/prefs.dart';
 import 'package:story_reader/sh_toc.dart';
 import 'dart:ui' as ui;
@@ -273,6 +275,11 @@ class _SeriesNetPageState extends State<SeriesNetPage> {
                             for (var c in chapters!) {
                               l.add(Row(
                                 children: [
+                                  // Leading book chapter number parsed from
+                                  // the title (the live TOC index is never
+                                  // shown as a number).
+                                  if (parseChapterNumber(c.name) case var n?)
+                                    ChapterNumberPrefix(n),
                                   Flexible(fit: FlexFit.tight, child: Text(c.name, softWrap: true)),
                                   StreamBuilder(
                                       stream: appDB.chapterStatusByID(widget.site, widget.id, c.id),
@@ -330,6 +337,9 @@ class _SeriesNetPageState extends State<SeriesNetPage> {
                                       Divider(),
                                       ...removed.map((c) => Row(
                                             children: [
+                                              if (displayChapterNumber(c.name, c.chapterNumber)
+                                                  case var n?)
+                                                ChapterNumberPrefix(n),
                                               Flexible(
                                                   fit: FlexFit.tight,
                                                   child: Text(c.name, softWrap: true)),
