@@ -44,6 +44,7 @@ dependencies:
   flutter_image: ^4.1.6
   shelf: ^1.4.1
   html: ^0.15.4
+  archive: ^4.0.7
   
   
   #shelf_proxy: ^1.0.0
