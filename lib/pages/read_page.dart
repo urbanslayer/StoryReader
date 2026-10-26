@@ -34,41 +34,73 @@ class _ReadPageState extends State<ReadPage> {
 
   int? lastOffset;
 
+  bool _readMarked = false;
+
   @override
   void initState() {
     super.initState();
     sc = ScrollController(initialScrollOffset: widget.chapter.scrollPosition?.toDouble() ?? 0.0);
-    sc.addListener(() => lastOffset = sc.offset.round());
-    appDB.setLastRead(widget.chapter.site, widget.chapter.id, widget.chapter.number);
+    sc.addListener(() {
+      lastOffset = sc.offset.round();
+      // Reading to the bottom counts as read, like pressing Next.
+      if (!_readMarked && sc.hasClients && sc.position.maxScrollExtent > 0 &&
+          sc.offset >= sc.position.maxScrollExtent - 16) {
+        _markCurrentRead();
+      }
+    });
+    // Stable identity: the last-read marker is the site chapterID, not the
+    // legacy `number` slot (which shifts when the author deletes chapters).
+    appDB.setLastReadChapter(widget.chapter.site, widget.chapter.id, widget.chapter.chapterID);
+  }
+
+  void _markCurrentRead() {
+    if (_readMarked) {
+      return;
+    }
+    _readMarked = true;
+    appDB.setRead(widget.chapter.site, widget.chapter.id, widget.chapter.chapterID, true);
   }
 
   @override
   void dispose() {
     super.dispose();
     if (erasePosition || lastOffset == null) {
-      appDB.setScrollPosition(widget.chapter.site, widget.chapter.id, widget.chapter.number, null);
+      appDB.setScrollPositionByID(widget.chapter.site, widget.chapter.id, widget.chapter.chapterID, null);
     } else {
-      appDB.setScrollPosition(widget.chapter.site, widget.chapter.id, widget.chapter.number, lastOffset!.toInt());
+      appDB.setScrollPositionByID(
+          widget.chapter.site, widget.chapter.id, widget.chapter.chapterID, lastOffset!.toInt());
     }
     sc.dispose();
   }
 
-  void _goNext() {
+  /// Resolves the neighbour of the current chapter **by chapterID** in the
+  /// canonically ordered downloaded list, applying the navigation rule in
+  /// [chapterAfter]/[chapterBefore] (retained-removed chapters are skipped
+  /// unless the current chapter itself is one).
+  Future<void> _go(bool forward) async {
     inProgress ??= (() async {
       var chapters = await appDB.chaptersForFuture(SeriesData(site: widget.chapter.site, id: widget.chapter.id));
-      int i = chapters.indexWhere((e) => e.number == widget.chapter.number);
-      if (i != -1 && i < chapters.length - 1) {
-        //erasePosition = true;
-        router.replace("/read", extra: chapters[i + 1].toJson());
+      var target = forward
+          ? chapterAfter(chapters, widget.chapter.chapterID)
+          : chapterBefore(chapters, widget.chapter.chapterID);
+      if (target != null) {
+        if (forward) {
+          // Moving past a chapter means it was read.
+          _markCurrentRead();
+        }
+        router.replace("/read", extra: target.toJson());
       }
       inProgress = null;
     })();
+    await inProgress;
   }
+
+  void _goNext() => _go(true);
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      key: Key(widget.chapter.number.toString()),
+      key: Key(widget.chapter.chapterID),
       body: SafeArea(
         child: FutureBuilder(
           future: richTextDocumentToSlivers(appDB.chapterContents(widget.chapter)!, context, widget.chapter),
@@ -87,23 +119,11 @@ class _ReadPageState extends State<ReadPage> {
                   pinned: true,
                   title: Row(
                     children: [
-                      ElevatedButton(
-                          onPressed: () {
-                            inProgress ??= (() async {
-                              var chapters = await appDB
-                                  .chaptersForFuture(SeriesData(site: widget.chapter.site, id: widget.chapter.id));
-                              int i = chapters.indexWhere((e) => e.number == widget.chapter.number);
-                              if (i > 0) {
-                                router.replace("/read", extra: chapters[i - 1].toJson());
-                              }
-                              inProgress = null;
-                            })();
-                          },
-                          child: Text("Previous")),
+                      ElevatedButton(onPressed: () => _go(false), child: Text("Previous")),
                       Flexible(
                         fit: FlexFit.tight,
                         child: Center(
-                            child: Text("${widget.chapter.number + 1} - ${widget.chapter.name}",
+                            child: Text(widget.chapter.name,
                                 softWrap: true, style: const TextStyle(fontSize: 26))),
                       ),
                       ElevatedButton(onPressed: () => _goNext(), child: Text("Next")),

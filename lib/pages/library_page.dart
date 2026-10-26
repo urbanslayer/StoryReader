@@ -2,10 +2,8 @@ import 'dart:math';
 
 import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
-import 'package:story_reader/db.dart';
 import 'package:story_reader/main.dart';
 import 'package:story_reader/prefs.dart';
-import 'package:story_reader/series_data.dart';
 
 class LibraryPage extends StatefulWidget {
   const LibraryPage({super.key});
@@ -88,15 +86,21 @@ class _LibraryPageState extends State<LibraryPage> {
                                 child: Text(s.name, softWrap: true),
                               )),
                         )),
-                        if (s.lastRead != null)
+                        if (s.lastRead != null || s.lastReadChapterID != null)
                           Flexible(
                             child: Padding(
                               padding: const EdgeInsets.all(4.0),
                               child: ElevatedButton(
-                                  onPressed: () async => router.push("/read",
-                                      extra: (await appDB.chaptersForFuture(SeriesData(site: s.site, id: s.id)))
-                                          .firstWhere((c) => c.number == s.lastRead)
-                                          .toJson()),
+                                  onPressed: () async {
+                                    // Stable identity: lastReadChapter resolves
+                                    // lastReadChapterID (legacy lastRead only as
+                                    // fallback) — the old `number`-slot lookup
+                                    // threw StateError after an upstream deletion.
+                                    var target = await appDB.lastReadChapter(s.site, s.id);
+                                    if (target != null) {
+                                      router.push("/read", extra: target.toJson());
+                                    }
+                                  },
                                   child: Padding(
                                     padding: const EdgeInsets.all(4.0),
                                     child: Text("Continue"),

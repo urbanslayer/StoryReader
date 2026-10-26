@@ -37,7 +37,8 @@ final router = GoRouter(routes: [
   }),
   GoRoute(path: "/read", pageBuilder: (c, s) {
     var e = Chapter.fromJson(s.extra as Map<String, dynamic>);
-    return MaterialPage(child: RootRestorationScope(restorationId: "read", child: ReadPage(e, key: Key(e.number.toString()))));
+    // Key by the stable site chapter id, not the legacy `number` slot.
+    return MaterialPage(child: RootRestorationScope(restorationId: "read", child: ReadPage(e, key: Key(e.chapterID))));
   }),
   GoRoute(path: "/shareNet", pageBuilder: (c, s) => MaterialPage(child: RootRestorationScope(restorationId: "shareNet", child: ShareNetworkPage()))),
   GoRoute(path: "/loadNet", pageBuilder: (c, s) => MaterialPage(child: RootRestorationScope(restorationId: "loadNet", child: LoadNetworkPage()))),

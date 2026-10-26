@@ -1,11 +1,11 @@
 import 'dart:typed_data';
 
-import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 import 'package:story_reader/db.dart';
 import 'package:story_reader/download_manager.dart';
 import 'package:story_reader/main.dart';
 import 'package:story_reader/prefs.dart';
+import 'package:story_reader/sh_toc.dart';
 import 'dart:ui' as ui;
 
 import '../series_data.dart';
@@ -29,6 +29,50 @@ class _SeriesNetPageState extends State<SeriesNetPage> {
   int? thumbnailHeight;
   
   bool errored = false;
+
+  /// The series is in the library (a `series` row exists): its DB rows were
+  /// reconciled against the live TOC and the retained-removed section may
+  /// exist.
+  bool inLibrary = false;
+
+  /// Non-null when ScribbleHub answered with a Cloudflare interstitial:
+  /// show an inline message instead of silently popping.
+  String? blockedMessage;
+
+  /// Applies a freshly-fetched ascending TOC: reconciles the stored chapters
+  /// against it when (and only when) the series is already in the library —
+  /// browsing must never create chapter rows — then renders.
+  Future<void> _applyToc(List<ChapterData> ascending) async {
+    var lib = await appDB.hasSeries(widget.site, widget.id);
+    if (lib) {
+      await appDB.reconcileChapters(widget.site, widget.id, ascending);
+    }
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      chapters = ascending;
+      inLibrary = lib;
+    });
+  }
+
+  /// Error handler for the TOC fetches: a blocked site is surfaced to the
+  /// user; everything else keeps the historical pop-to-behaviour.
+  void _onTocError(Object d, StackTrace t) {
+    if (d is SiteBlocked) {
+      if (mounted) {
+        setState(() {
+          blockedMessage =
+              "ScribbleHub blocked the request (Cloudflare). Try again later.";
+        });
+      }
+      return;
+    }
+    if (!errored) {
+      errored = true;
+      Future.microtask(() async => router.pop());
+    }
+  }
   
   Future<void> _setThumbnail(Uint8List? thumbnail) async {
     if (Preferences.useImages.value && thumbnail != null) {
@@ -65,15 +109,9 @@ class _SeriesNetPageState extends State<SeriesNetPage> {
         shC
             .chapters(widget.id)
             .then((r) => r.body!)
-            .then((cs) => setState(() {
-                  chapters = cs.reversed.toList();
-                }))
-            .onError((d, t) {
-              if (! errored) {
-                errored = true;
-                Future.microtask(() async => router.pop());
-              }
-            });
+            // ScribbleHub returns newest-first; canonical order is ascending.
+            .then((cs) => _applyToc(cs.reversed.toList()))
+            .onError(_onTocError);
       case Site.royalRoad:
         req = rrC.series(widget.id, widget.name).then((r) async {
           var b = r.body!;
@@ -81,9 +119,8 @@ class _SeriesNetPageState extends State<SeriesNetPage> {
           var cl = b.$2;
           var thumbnail = s.thumbnail;
           await _setThumbnail(thumbnail);
-          setState(() {
-            chapters = cl;
-          });
+          // RoyalRoad already lists chapters ascending.
+          await _applyToc(cl);
           return s;
         }).onError((d, t) {
           if (! errored) {
@@ -175,88 +212,132 @@ class _SeriesNetPageState extends State<SeriesNetPage> {
                           Divider(),
                         ]),
                         ...(() {
-                          var l = <SliverList>[];
-                          if (chapters == null) {
-                            l.add(SliverList.list(children: const [Center(child: CircularProgressIndicator())]));
-                          } else {
-                            l.add(SliverList.list(children: [
-                              Row(
-                                children: [
-                                  const Flexible(
-                                    fit: FlexFit.tight,
-                                    child: Text(
-                                      "Chapters:",
-                                      style: TextStyle(fontSize: 20),
-                                      softWrap: true,
-                                    ),
-                                  ),
-                                  ElevatedButton(
-                                      onPressed: () async {
-                                        await appDB.addSeriesIfNeeded(
-                                            widget.site, widget.id, s.name, s.description, s.thumbnail, thumbnailWidth, thumbnailHeight);
-                                        await appDB.updateLastReadDate(widget.site, widget.id);
-                                        List<int> indexes = [];
-                                        List<String> ids = [];
-                                        List<String> names = [];
-                                        for (var (i, c) in chapters!.indexed) {
-                                          indexes.add(i);
-                                          ids.add(c.id);
-                                          names.add(c.name);
-                                        }
-                                        appDB.queueChapters(widget.site, widget.id, names, indexes, ids);
-                                        startDownloadManager();
-                                      },
-                                      child: Text("Download all")),
-                                ],
-                              ),
-                              Divider(),
-                            ]));
-                            l.add(SliverList.separated(
-                              itemBuilder: (_, i) {
-                                var c = chapters![i];
-                                return Row(
-                                  children: [
-                                    Flexible(fit: FlexFit.tight, child: Text(c.name, softWrap: true)),
-                                    StreamBuilder(
-                                        stream: appDB.chapterStatus(widget.site, widget.id, i),
-                                        builder: (_, d) {
-                                          if (d.hasData) {
-                                            var status = d.data!;
-                                            switch (status) {
-                                              case ChapterStatus.downloaded:
-                                                return ElevatedButton(
-                                                    onPressed: () {
-                                                      appDB.deleteChapter(widget.site, widget.id, i);
-                                                    },
-                                                    child: Text("Delete"));
-                                              case ChapterStatus.queued:
-                                                return ElevatedButton(
-                                                    onPressed: () {
-                                                      appDB.dequeueChapter(widget.site, widget.id, i);
-                                                    },
-                                                    child: Text("Unqueue"));
-                                              case ChapterStatus.online:
-                                                return ElevatedButton(
-                                                    onPressed: () async {
-                                                      await appDB.addSeriesIfNeeded(
-                                                          widget.site, widget.id, s.name, s.description, s.thumbnail, thumbnailWidth, thumbnailHeight);
-                                                      await appDB.updateLastReadDate(widget.site, widget.id);
-                                                      appDB.queueChapter(widget.site, c.name, widget.id, i, c.id);
-                                                      startDownloadManager();
-                                                    },
-                                                    child: Text("Download"));
-                                            }
-                                          }
-                                          return SizedBox.shrink();
-                                        })
-                                  ],
-                                );
-                              },
-                              separatorBuilder: (c, i) => const Divider(),
-                              itemCount: chapters!.length,
+                          var l = <Widget>[];
+                          if (blockedMessage != null) {
+                            l.add(Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 16.0),
+                              child: Center(
+                                  child: Text(blockedMessage!,
+                                      softWrap: true, textAlign: TextAlign.center)),
                             ));
                           }
-                          return l;
+                          if (chapters == null) {
+                            if (blockedMessage == null) {
+                              l.add(Center(child: CircularProgressIndicator()));
+                            }
+                          } else {
+                            l.add(Row(
+                              children: [
+                                const Flexible(
+                                  fit: FlexFit.tight,
+                                  child: Text(
+                                    "Chapters:",
+                                    style: TextStyle(fontSize: 20),
+                                    softWrap: true,
+                                  ),
+                                ),
+                                ElevatedButton(
+                                    onPressed: () async {
+                                      await appDB.addSeriesIfNeeded(
+                                          widget.site, widget.id, s.name, s.description, s.thumbnail, thumbnailWidth, thumbnailHeight);
+                                      await appDB.updateLastReadDate(widget.site, widget.id);
+                                      List<int> indexes = [];
+                                      List<String> ids = [];
+                                      List<String> names = [];
+                                      for (var (i, c) in chapters!.indexed) {
+                                        indexes.add(i);
+                                        ids.add(c.id);
+                                        names.add(c.name);
+                                      }
+                                      // The index is stored as `position`; identity stays the chapterID.
+                                      appDB.queueChapters(widget.site, widget.id, names, indexes, ids);
+                                      startDownloadManager();
+                                    },
+                                    child: Text("Download all")),
+                              ],
+                            ));
+                            l.add(Divider());
+                            for (var c in chapters!) {
+                              l.add(Row(
+                                children: [
+                                  Flexible(fit: FlexFit.tight, child: Text(c.name, softWrap: true)),
+                                  StreamBuilder(
+                                      stream: appDB.chapterStatusByID(widget.site, widget.id, c.id),
+                                      builder: (_, d) {
+                                        if (d.hasData) {
+                                          var status = d.data!;
+                                          switch (status) {
+                                            case ChapterStatus.downloaded:
+                                              return ElevatedButton(
+                                                  onPressed: () {
+                                                    appDB.deleteChapterByID(widget.site, widget.id, c.id);
+                                                  },
+                                                  child: Text("Delete"));
+                                            case ChapterStatus.queued:
+                                              return ElevatedButton(
+                                                  onPressed: () {
+                                                    appDB.dequeueChapterByID(widget.site, widget.id, c.id);
+                                                  },
+                                                  child: Text("Unqueue"));
+                                            case ChapterStatus.online:
+                                              return ElevatedButton(
+                                                  onPressed: () async {
+                                                    await appDB.addSeriesIfNeeded(
+                                                        widget.site, widget.id, s.name, s.description, s.thumbnail, thumbnailWidth, thumbnailHeight);
+                                                    await appDB.updateLastReadDate(widget.site, widget.id);
+                                                    // `i` here is the live TOC position, not an identity.
+                                                    appDB.queueChapter(widget.site, c.name, widget.id, chapters!.indexOf(c), c.id);
+                                                    startDownloadManager();
+                                                  },
+                                                  child: Text("Download"));
+                                          }
+                                        }
+                                        return SizedBox.shrink();
+                                      })
+                                ],
+                              ));
+                              l.add(Divider());
+                            }
+                          }
+                          if (inLibrary) {
+                            l.add(StreamBuilder<List<Chapter>>(
+                              stream: appDB.missingUpstreamChapters(
+                                  SeriesData(site: widget.site, id: widget.id)),
+                              builder: (_, d) {
+                                var removed = d.data ?? const <Chapter>[];
+                                if (removed.isEmpty) {
+                                  return const SizedBox.shrink();
+                                }
+                                return Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Divider(),
+                                      Text("Removed by author (kept offline)",
+                                          style: TextStyle(fontSize: 20)),
+                                      Divider(),
+                                      ...removed.map((c) => Row(
+                                            children: [
+                                              Flexible(
+                                                  fit: FlexFit.tight,
+                                                  child: Text(c.name, softWrap: true)),
+                                              Padding(
+                                                padding: const EdgeInsets.only(right: 8.0),
+                                                child: ElevatedButton(
+                                                    onPressed: () =>
+                                                        router.push("/read", extra: c.toJson()),
+                                                    child: Text("Read")),
+                                              ),
+                                              ElevatedButton(
+                                                  onPressed: () => appDB
+                                                      .deleteChapterByID(widget.site, widget.id, c.chapterID),
+                                                  child: Text("Delete")),
+                                            ],
+                                          )),
+                                    ]);
+                              },
+                            ));
+                          }
+                          return [SliverList.list(children: l)];
                         })(),
                       ],
                     ));

@@ -96,7 +96,7 @@ class _DownloadsPageState extends State<DownloadsPage> {
             Flexible(flex: 1, fit: FlexFit.tight, child: Text("${s.name} - ${c.number + 1}", softWrap: true)),
             Padding(
               padding: const EdgeInsets.only(right: 16.0),
-              child: ElevatedButton(onPressed: () => appDB.dequeueChapter(c.site, c.id, c.number), child: Text("Dequeue")),
+              child: ElevatedButton(onPressed: () => appDB.dequeueChapterByID(c.site, c.id, c.chapterID), child: Text("Dequeue")),
             )
           ],);
         }, separatorBuilder: (c, i) => const Divider(), itemCount: images!.length + queued!.length)

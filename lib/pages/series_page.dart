@@ -1,3 +1,4 @@
+import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 import 'package:story_reader/db.dart';
 import 'package:story_reader/main.dart';
@@ -47,7 +48,7 @@ class _SeriesPageState extends State<SeriesPage> {
                             flex: 3,
                             child: Text(widget.series.name, softWrap: true, style: const TextStyle(fontSize: 20))),
                         if (size.width >= breakpoint) _deleteButton(c),
-                        if (widget.series.lastRead != null && size.width >= breakpoint) _continueButton(chapters),
+                        if (chapters.isNotEmpty && size.width >= breakpoint) _continueButton(chapters),
                         if (size.width >= breakpoint) _netButton(),
                       ],
                     ),
@@ -65,7 +66,7 @@ class _SeriesPageState extends State<SeriesPage> {
                                   child: Text("Online Version"),
                                   value: 1,
                                 ),
-                                if (widget.series.lastRead != null)
+                                if (chapters.isNotEmpty)
                                   const PopupMenuItem(
                                     child: Text("Continue"),
                                     value: 2,
@@ -79,7 +80,7 @@ class _SeriesPageState extends State<SeriesPage> {
                               if (v == 1) {
                                 _doNet();
                               }
-                              if (v == 2 && widget.series.lastRead != null) {
+                              if (v == 2 && chapters.isNotEmpty) {
                                 _doContinue(chapters);
                               }
                             },
@@ -91,6 +92,16 @@ class _SeriesPageState extends State<SeriesPage> {
                   SliverList.separated(
                     itemBuilder: (c, i) {
                       var c = chapters[i];
+                      // Chapter identity and delete target is the site
+                      // chapterID; the legacy `number` slot is a meaningless
+                      // index once chapters are deleted upstream — never show
+                      // or key on it.
+                      String? badge = switch (c.upstreamState) {
+                        ChapterUpstreamState.missingUpstream => "Removed by author",
+                        ChapterUpstreamState.renamed => "Renamed upstream",
+                        ChapterUpstreamState.upstream => null,
+                      };
+                      var label = Text(c.name, softWrap: true);
                       return Padding(
                         padding: const EdgeInsets.symmetric(horizontal: 8.0),
                         child: Row(
@@ -100,17 +111,41 @@ class _SeriesPageState extends State<SeriesPage> {
                               flex: 3,
                               child: Padding(
                                 padding: const EdgeInsets.only(right: 32.0),
-                                child: Text("${c.number + 1} - ${c.name}", softWrap: true),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    // Read chapters are dimmed.
+                                    Opacity(opacity: c.isRead ? 0.5 : 1.0, child: label),
+                                    if (badge != null)
+                                      Text(badge,
+                                          style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic)),
+                                  ],
+                                ),
                               ),
                             ),
                             Padding(
                               padding: const EdgeInsets.only(right: 32.0),
                               child: ElevatedButton(
-                                  onPressed: () => router.push("/read", extra: c.toJson()), child: const Text("Read")),
+                                  onPressed: () => router.push("/read", extra: c.toJson()),
+                                  child: const Text("Read")),
                             ),
                             ElevatedButton(
-                                onPressed: () => appDB.deleteChapter(widget.series.site, widget.series.id, c.number),
+                                onPressed: () =>
+                                    appDB.deleteChapterByID(widget.series.site, widget.series.id, c.chapterID),
                                 child: const Text("Delete")),
+                            PopupMenuButton<String>(
+                              itemBuilder: (_) => [
+                                const PopupMenuItem(
+                                  value: "markReadUpTo",
+                                  child: Text("Mark all read up to here"),
+                                ),
+                              ],
+                              onSelected: (v) {
+                                if (v == "markReadUpTo") {
+                                  appDB.markReadUpTo(widget.series.site, widget.series.id, c.chapterID);
+                                }
+                              },
+                            ),
                           ],
                         ),
                       );
@@ -159,8 +194,19 @@ class _SeriesPageState extends State<SeriesPage> {
     ));
   }
 
-  Future<Object?> _doContinue(List<Chapter> chapters) =>
-      router.push("/read", extra: chapters.firstWhere((c) => c.number == widget.series.lastRead).toJson());
+  /// Continue: the stable last-read chapter (by chapterID), falling back to
+  /// the first unread chapter, then the first chapter. The legacy numeric
+  /// `lastRead` slot lookup is gone — it threw StateError once the slot no
+  /// longer matched any downloaded chapter.
+  Future<Object?> _doContinue(List<Chapter> chapters) async {
+    var target = await appDB.lastReadChapter(widget.series.site, widget.series.id) ??
+        chapters.firstWhereOrNull((c) => !c.isRead) ??
+        chapters.firstOrNull;
+    if (target == null) {
+      return null;
+    }
+    return router.push("/read", extra: target.toJson());
+  }
 
   Flexible _deleteButton(BuildContext c) {
     return Flexible(

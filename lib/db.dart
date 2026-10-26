@@ -75,6 +75,47 @@ enum ChapterUpstreamState {
 /// position ASC puts such rows after every live chapter.
 const int kNoPosition = 9223372036854775807;
 
+/// Navigation rule for Previous/Next over a canonically-ordered chapter list.
+///
+/// Canonical order sorts retained-removed chapters (`missingUpstream`,
+/// `position = kNoPosition`) *after* every live chapter, which is right for
+/// listing but wrong mid-book: stepping forward through live chapters must
+/// not suddenly jump into the retained section, and stepping back must not
+/// fall out of it early. So navigation **skips `missingUpstream` rows unless
+/// the current chapter itself is `missingUpstream`** — inside the retained
+/// section you can page through it, leaving by the same neighbour a listing
+/// implies. [chapterAfter]/[chapterBefore] return null at the ends.
+Chapter? chapterAfter(List<Chapter> ordered, String chapterID) {
+  var i = ordered.indexWhere((c) => c.chapterID == chapterID);
+  if (i == -1) {
+    return null;
+  }
+  var allowMissing = ordered[i].upstreamState == ChapterUpstreamState.missingUpstream;
+  for (var j = i + 1; j < ordered.length; j++) {
+    if (!allowMissing && ordered[j].upstreamState == ChapterUpstreamState.missingUpstream) {
+      continue;
+    }
+    return ordered[j];
+  }
+  return null;
+}
+
+/// Inverse of [chapterAfter] (see its doc for the navigation rule).
+Chapter? chapterBefore(List<Chapter> ordered, String chapterID) {
+  var i = ordered.indexWhere((c) => c.chapterID == chapterID);
+  if (i <= 0) {
+    return null;
+  }
+  var allowMissing = ordered[i].upstreamState == ChapterUpstreamState.missingUpstream;
+  for (var j = i - 1; j >= 0; j--) {
+    if (!allowMissing && ordered[j].upstreamState == ChapterUpstreamState.missingUpstream) {
+      continue;
+    }
+    return ordered[j];
+  }
+  return null;
+}
+
 class Chapters extends Table {
   IntColumn get site => intEnum<Site>().references(SeriesTable, #site)();
   TextColumn get id => text().references(SeriesTable, #id)();
@@ -634,6 +675,117 @@ class AppDB extends _$AppDB {
     return select(chapters)
       ..where((c) => c.id.equals(s.id) & c.site.equals(s.site.index) & c.content.isNotNull())
       ..orderBy(canonicalChapterOrder);
+  }
+
+  /// Whether a series row exists, i.e. the series is in the library. Only
+  /// library series get `reconcileChapters` runs from the online view.
+  Future<bool> hasSeries(Site site, String id) {
+    return (select(seriesTable)..where((s) => s.site.equals(site.index) & s.id.equals(id))..limit(1))
+        .get()
+        .then((l) => l.isNotEmpty);
+  }
+
+  /// Status of the one row identified by the site chapter id. Identity is
+  /// always the `chapterID` — never a TOC index — so a deleted-and-shifted
+  /// chapter cannot re-point this status at different content.
+  Stream<ChapterStatus> chapterStatusByID(Site site, String id, String chapterID) {
+    return (select(chapters)
+          ..where((c) => c.site.equals(site.index) & c.id.equals(id) & c.chapterID.equals(chapterID)))
+        .watch()
+        .map((cl) {
+      var c = cl.firstOrNull;
+      if (c == null) {
+        return ChapterStatus.online;
+      }
+      if (c.content != null) {
+        return ChapterStatus.downloaded;
+      }
+      if (c.queued) {
+        return ChapterStatus.queued;
+      }
+      return ChapterStatus.online;
+    });
+  }
+
+  /// Retained chapters the author removed from the live TOC and whose content
+  /// is stored locally, in canonical order — the "Removed by author (kept
+  /// offline)" section of the online series view.
+  Stream<List<Chapter>> missingUpstreamChapters(SeriesData s) {
+    return (select(chapters)
+          ..where((c) =>
+              c.site.equals(s.site.index) &
+              c.id.equals(s.id) &
+              c.content.isNotNull() &
+              c.upstreamState.equals(ChapterUpstreamState.missingUpstream.index))
+          ..orderBy(canonicalChapterOrder))
+        .watch();
+  }
+
+  /// Deletes the chapter identified by [chapterID] and clears the stable
+  /// last-read marker when it pointed at this chapter.
+  Future<void> deleteChapterByID(Site site, String id, String chapterID) {
+    return transaction(() async {
+      var s = await (select(seriesTable)..where((s) => s.site.equals(site.index) & s.id.equals(id))).getSingleOrNull();
+      var doomed = await (select(chapters)
+            ..where((c) => c.site.equals(site.index) & c.id.equals(id) & c.chapterID.equals(chapterID)))
+          .get();
+      for (var c in doomed) {
+        await (delete(chapters)..whereSamePrimaryKey(c)).go();
+      }
+      if (s != null && s.lastReadChapterID == chapterID) {
+        await setLastReadChapter(site, id, null);
+      }
+    });
+  }
+
+  /// Takes the download queue flag off the chapter identified by [chapterID]
+  /// (only while it has no content — a downloaded chapter is not "queued").
+  Future<void> dequeueChapterByID(Site site, String id, String chapterID) {
+    return transaction(() async {
+      var row = (await (select(chapters)
+            ..where((c) => c.site.equals(site.index) & c.id.equals(id) & c.chapterID.equals(chapterID)))
+          .get())
+          .firstOrNull;
+      if (row != null && row.content == null) {
+        await (update(chapters)..whereSamePrimaryKey(row)).write(const ChaptersCompanion(queued: Value(false)));
+      }
+    });
+  }
+
+  /// Scroll position keyed by the stable chapter identity.
+  Future<void> setScrollPositionByID(Site site, String id, String chapterID, int? position) {
+    return customUpdate(
+      "UPDATE chapters SET scroll_position = ? WHERE site = ? AND id = ? AND chapter_i_d = ?",
+      variables: [
+        Variable(position),
+        Variable.withInt(site.index),
+        Variable.withString(id),
+        Variable.withString(chapterID),
+      ],
+      updates: {chapters},
+      updateKind: UpdateKind.update,
+    );
+  }
+
+  /// Marks [chapterID] and every chapter at or before it in canonical order
+  /// as read — the "Mark all read up to here" action feeding the EPUB export
+  /// of the next unread chapters.
+  Future<void> markReadUpTo(Site site, String id, String chapterID) {
+    return transaction(() async {
+      var all = await (select(chapters)
+            ..where((c) => c.site.equals(site.index) & c.id.equals(id))
+            ..orderBy(canonicalChapterOrder))
+          .get();
+      var idx = all.indexWhere((c) => c.chapterID == chapterID);
+      if (idx == -1) {
+        return;
+      }
+      for (var c in all.take(idx + 1)) {
+        if (!c.isRead) {
+          await (update(chapters)..whereSamePrimaryKey(c)).write(const ChaptersCompanion(isRead: Value(true)));
+        }
+      }
+    });
   }
 
   /// Picks a free legacy `number` slot for a fresh row: [preferred] when
