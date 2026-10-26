@@ -8,6 +8,7 @@ import 'package:go_router/go_router.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'l10n/localizations.dart';
+import 'package:story_reader/browser_fetch.dart';
 import 'package:story_reader/db.dart';
 import 'package:story_reader/download_manager.dart';
 import 'package:story_reader/pages/load_network_page.dart';
@@ -16,6 +17,7 @@ import 'package:story_reader/pages/series_net_page.dart';
 import 'package:story_reader/pages/series_page.dart';
 import 'package:story_reader/pages/share_network_page.dart';
 import 'package:story_reader/pages/update_page.dart';
+import 'package:story_reader/pages/verify_page.dart';
 import 'package:story_reader/prefs.dart';
 import 'package:story_reader/rr.dart';
 import 'package:story_reader/series_data.dart';
@@ -43,7 +45,11 @@ final router = GoRouter(routes: [
   GoRoute(path: "/shareNet", pageBuilder: (c, s) => MaterialPage(child: RootRestorationScope(restorationId: "shareNet", child: ShareNetworkPage()))),
   GoRoute(path: "/loadNet", pageBuilder: (c, s) => MaterialPage(child: RootRestorationScope(restorationId: "loadNet", child: LoadNetworkPage()))),
   GoRoute(path: "/licenses", pageBuilder: (c, s) => MaterialPage(child: LicensePage())),
-  GoRoute(path: "/update", pageBuilder: (c, s) => MaterialPage(child: UpdatePage()))
+  GoRoute(path: "/update", pageBuilder: (c, s) => MaterialPage(child: UpdatePage())),
+  GoRoute(path: "/verify", pageBuilder: (c, s) {
+    var e = s.extra as Map<String, dynamic>;
+    return MaterialPage(child: VerifyPage(url: Uri.parse(e["url"] as String)));
+  })
 ], restorationScopeId: "router");
 
 late AppDB appDB;
@@ -86,8 +92,49 @@ void main() async {
   runApp(const ThemeChangerWidget(child: RootRestorationScope(restorationId: "root", child: ProviderScope(child: MainApp()))));
 }
 
-class MainApp extends StatelessWidget {
+class MainApp extends StatefulWidget {
   const MainApp({super.key});
+
+  @override
+  State<MainApp> createState() => _MainAppState();
+}
+
+class _MainAppState extends State<MainApp> {
+  /// True while the verification screen is pushed, so one pending
+  /// verification can never stack duplicate routes.
+  bool _verifyOpen = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (BrowserFetcher.isSupported) {
+      BrowserFetcher.instance.verificationNeeded.addListener(_onVerificationNeeded);
+    }
+  }
+
+  @override
+  void dispose() {
+    if (BrowserFetcher.isSupported) {
+      BrowserFetcher.instance.verificationNeeded.removeListener(_onVerificationNeeded);
+    }
+    super.dispose();
+  }
+
+  /// The browser fetcher publishes the challenged URL here; show the
+  /// human-verification screen wherever the app currently is (the download
+  /// continues automatically when the user finishes the check).
+  void _onVerificationNeeded() {
+    var url = BrowserFetcher.instance.verificationNeeded.value;
+    if (url == null || _verifyOpen) {
+      return;
+    }
+    _verifyOpen = true;
+    // Wait for the first frame so the router has a navigator to push onto.
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await router.push("/verify", extra: {"url": url.toString()});
+      _verifyOpen = false;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
