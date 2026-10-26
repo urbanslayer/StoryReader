@@ -106,16 +106,15 @@ both with a `chapterId` lookup).
 
 ### Site parsing robustness (found while probing)
 
-`sh.chapters()` assumes `wi_gettocchp` returns one page
-(`body.children[0].children[0].children`) and there is no pagination fallback. From this machine,
-`POST /wp-admin/admin-ajax.php` now returns a Cloudflare interstitial (HTTP 403,
-"Just a moment…") while plain `GET /series/623932/…/` works. So:
+**Done (merged, `lib/sh_toc.dart`, `test/sh_toc_test.dart`).** Findings:
 
-- Add a fallback that parses the `.toc_w` entries from the series page (they carry `order`
-  and the same `/chapter/<id>/` links) across `?toc=N` pages.
-- Consider sending the browser UA from chopper clients — `lib/client.dart` sets a Firefox UA for
-  the image isolate but `SHAPI`/`RRAPI` use their own `ChopperClient`s with no UA
-  (`RetryInterceptor` even has the UA line commented out).
+- The Cloudflare 403 on `wi_gettocchp` is triggered by a **spoofed browser User-Agent**, not by the
+  endpoint: a Firefox UA → 403 "Just a moment…", an honest `Dart/…` UA → 200 with all 448
+  chapters of *On Astral Tides* (re-verified with curl). Never set a browser UA on site clients;
+  `lib/client.dart` documents this and both chopper clients now share `httpClient()`.
+- `SHAPI.chapters()` falls back to the series page + `?toc=N` pages (needs the series page as
+  `Referer`), never returns a partial TOC, and throws a typed `SiteBlocked` on an interstitial.
+  It still returns **newest-first**; `parseScribbleHubToc()` returns ascending.
 
 ### Acceptance checks
 
