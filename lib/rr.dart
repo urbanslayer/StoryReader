@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:chopper/chopper.dart';
 import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart';
+import 'package:story_reader/client.dart';
 import 'package:story_reader/db.dart';
 import 'package:story_reader/prefs.dart';
 import 'package:story_reader/rich_text_tree.dart';
@@ -166,4 +167,4 @@ String _removeCommas(String s) {
   return s.replaceAll(",", "");
 }
 
-final _rrC = ChopperClient(interceptors: [RetryInterceptor()]);
+final _rrC = ChopperClient(client: httpClient(), interceptors: [RetryInterceptor()]);
