@@ -11,17 +11,31 @@ import 'package:story_reader/prefs.dart';
 import 'package:story_reader/rich_text_tree.dart';
 import 'package:story_reader/series_data.dart';
 import 'package:story_reader/sh.dart';
+import 'package:story_reader/sh_toc.dart';
 
 part 'rr.chopper.dart';
 
 
 const String baseURL = "https://www.royalroad.com/";
 
+/// Builds the typed [SiteBlocked] every RoyalRoad call site throws when an
+/// anti-bot challenge (Anubis today, measured 2026-10, with HTTP 200)
+/// answers instead of content.
+SiteBlocked _rrBlocked(String url, int statusCode, String body) => SiteBlocked(
+      url,
+      statusCode: statusCode,
+      kind: botChallengeKind(statusCode, body),
+      siteName: "RoyalRoad",
+    );
+
 @ChopperApi(baseUrl: baseURL)
 abstract class RRAPI extends ChopperService {
   
   Future<Response<List<SeriesData>>> simpleSearch(String name) async {
     var resp = await _simpleSearch(name);
+    if (isBotChallenge(resp.statusCode, resp.bodyString)) {
+      throw _rrBlocked("${baseURL}fictions/search", resp.statusCode, resp.bodyString);
+    }
     if (! resp.isSuccessful) {
       return resp.copyWith();
     }
@@ -50,6 +64,9 @@ abstract class RRAPI extends ChopperService {
   
   Future<Response<(SeriesData, List<ChapterData>)>> series(String id, String name) async {
     var resp = await _series(id, slugify(name));
+    if (isBotChallenge(resp.statusCode, resp.bodyString)) {
+      throw _rrBlocked("${baseURL}fiction/$id/", resp.statusCode, resp.bodyString);
+    }
     if (! resp.isSuccessful) {
       return resp.copyWith();
     }
@@ -114,6 +131,10 @@ abstract class RRAPI extends ChopperService {
   
   Future<Response<ChapterData>> chapterContents(SeriesData s, String id, String name) async {
     var resp = await _chapterContents(s.id, slugify(s.name), id, slugify(name));
+    if (isBotChallenge(resp.statusCode, resp.bodyString)) {
+      throw _rrBlocked("${baseURL}fiction/${s.id}/chapter/$id/",
+          resp.statusCode, resp.bodyString);
+    }
     if (! resp.isSuccessful) {
       return resp.copyWith();
     }
@@ -160,7 +181,9 @@ abstract class RRAPI extends ChopperService {
   @Get(path: "fiction/{sid}/{sslug}/chapter/{cid}/{cslug}")
   Future<Response> _chapterContents(@Path("sid") String seriesID, @Path("sslug") String seriesSlug, @Path("cid") String chapterID, @Path("cslug") String chapterSlug);
   
-  static RRAPI create() => _$RRAPI(_rrC);
+  /// Builds an API instance. [client] is only for tests (fixture-replaying
+  /// clients); production uses the shared, retrying site client.
+  static RRAPI create([ChopperClient? client]) => _$RRAPI(client ?? _rrC);
 }
 
 String _removeCommas(String s) {

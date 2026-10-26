@@ -11,6 +11,8 @@
 //  - sh_ajax_fragment_live.html: captured real `wi_gettocchp` response for
 //    series 623932 (448 chapters, newest-first).
 //  - sh_cloudflare_interstitial.html: captured-style CF "Just a moment..." page.
+//  - rr_anubis_challenge.html: captured RoyalRoad Anubis PoW challenge page
+//    (served with HTTP 200, not a Cloudflare page).
 
 import 'dart:io';
 
@@ -129,6 +131,67 @@ void main() {
       expect(parseScribbleHubToc('not html at all \x00\x01 <<>> <a href='), isEmpty);
       expect(parseScribbleHubToc('<div><p>hello</p></div>'), isEmpty);
       expect(parseScribbleHubTocPages(['', 'junk <<<']), isEmpty);
+    });
+  });
+
+  group('bot challenge detection — Cloudflare + Anubis (isBotChallenge)', () {
+    final interstitial = fixture('sh_cloudflare_interstitial.html');
+    final anubis = fixture('rr_anubis_challenge.html');
+
+    test('Anubis fixture with status 200 is detected as an Anubis challenge', () {
+      // RoyalRoad answers with HTTP 200 — status rules alone would miss it.
+      expect(isBotChallenge(200, anubis), isTrue);
+      expect(botChallengeKind(200, anubis), BotChallengeKind.anubis);
+      expect(isBotChallenge(null, anubis), isTrue); // body alone suffices
+    });
+
+    test('Anubis fixture is NOT flagged by the Cloudflare-only predicate', () {
+      expect(isCloudflareInterstitial(200, anubis), isFalse);
+    });
+
+    test('Cloudflare fixture is detected and kinded as cloudflare', () {
+      expect(isBotChallenge(403, interstitial), isTrue);
+      expect(botChallengeKind(403, interstitial), BotChallengeKind.cloudflare);
+      expect(botChallengeKind(403, ''), BotChallengeKind.cloudflare); // status alone
+      expect(botChallengeKind(null, interstitial), BotChallengeKind.cloudflare);
+    });
+
+    test('real content is not flagged, null body tolerated', () {
+      expect(isBotChallenge(200, fixture('sh_series_page_live.html')), isFalse);
+      expect(isBotChallenge(200, '<div>chapters</div>'), isFalse);
+      expect(isBotChallenge(500, 'server exploded'), isFalse);
+      expect(isBotChallenge(null, null), isFalse);
+    });
+
+    test('a chapter merely mentioning "not a bot" is not a false positive', () {
+      expect(
+          isBotChallenge(200,
+              '<html><body>He swore: "I am not a bot," the AI insisted.</body></html>'),
+          isFalse);
+    });
+
+    test('Anubis fixture parses to zero chapters (would crash the parsers)', () {
+      expect(parseScribbleHubToc(anubis), isEmpty);
+    });
+
+    test('SiteBlocked carries kind/siteName and names them in userMessage', () {
+      const err = SiteBlocked('https://www.royalroad.com/fiction/1/',
+          statusCode: 200, kind: BotChallengeKind.anubis, siteName: 'RoyalRoad');
+      expect(err.userMessage, 'RoyalRoad is asking for a browser check (Anubis). Try again later.');
+      expect(err.toString(), contains('anubis'));
+      expect(err.toString(), contains('RoyalRoad'));
+    });
+
+    test('legacy SiteBlocked construction still works', () {
+      const err = SiteBlocked('https://www.scribblehub.com/wp-admin/admin-ajax.php',
+          statusCode: 403);
+      expect(err.kind, isNull);
+      expect(err.siteName, isNull);
+      expect(err.userMessage, 'The site blocked the request. Try again later.');
+      const cf = SiteBlocked('https://www.scribblehub.com/',
+          statusCode: 403, kind: BotChallengeKind.cloudflare, siteName: 'ScribbleHub');
+      expect(cf.userMessage,
+          'ScribbleHub is asking for a browser check (Cloudflare). Try again later.');
     });
   });
 

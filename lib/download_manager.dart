@@ -9,6 +9,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:http/http.dart' as http;
 import 'package:story_reader/client.dart';
 import 'package:story_reader/db.dart';
+import 'package:story_reader/download_outcome.dart';
 import 'package:story_reader/main.dart';
 import 'package:story_reader/rr.dart';
 import 'package:story_reader/series_data.dart';
@@ -56,8 +57,11 @@ void _chapterDownloadManager() async {
       var l = await db.queuedChapters();
       var sl = await db.series();
       var il = await db.queuedImages();
-      // Backoff: 60 s when the site blocked us (Cloudflare), 5 s after any
-      // other failure inside this pass, otherwise the normal 1 s poll.
+      // Backoff: 60 s when the site blocked us (Cloudflare/Anubis challenge
+      // or a 429 rate limit), 5 s after any other transient failure inside
+      // this pass, otherwise the normal 1 s poll. Chapters are only ever
+      // dropped from the queue when they are genuinely gone (404/410) or
+      // their page can never parse — see `classifyChapterFetch`.
       var backoff = const Duration(seconds: 1);
       try {
         for (var im in il) {
@@ -81,27 +85,45 @@ void _chapterDownloadManager() async {
               case Site.royalRoad:
                 resp = await rrC.chapterContents(SeriesData(site: c.site, id: c.id, name: s.name), c.chapterID, c.name);
             }
-            if (isCloudflareInterstitial(resp.statusCode, resp.bodyString)) {
-              // Blocked, not gone: keep the queue intact and back off.
-              throw SiteBlocked("chapter ${c.chapterID}", statusCode: resp.statusCode);
-            }
+            // The API layer throws SiteBlocked on a challenge page; classify
+            // whatever came back otherwise (null body from RetryInterceptor
+            // after 3 failed tries means "fetch failed", not "chapter gone").
             var data = resp.body;
-            if (data == null || data.content == null) {
-              // 404/410 (chapter deleted upstream) or a parse failure for
-              // *this* chapter: dequeue it and carry on with the rest, so one
-              // dead chapter cannot stall the whole queue forever.
-              print("Giving up on chapter ${c.chapterID} (${c.name}): HTTP ${resp.statusCode}");
-              await db.dequeueChapterByID(c.site, c.id, c.chapterID);
-              continue;
+            var outcome =
+                classifyChapterFetch(resp.statusCode, resp.bodyString, data?.content != null);
+            switch (outcome) {
+              case DownloadOutcome.save:
+                await db.saveChapter(c.site, c.id, c.number, c.chapterID, data!.content!, data.name);
+              case DownloadOutcome.dequeue:
+                // 404/410 (chapter deleted upstream) or a 200 page for *this*
+                // chapter that can never parse: dequeue it and carry on with
+                // the rest, so one dead chapter cannot stall the whole queue.
+                print("Giving up on chapter ${c.chapterID} (${c.name}): HTTP ${resp.statusCode}");
+                await db.dequeueChapterByID(c.site, c.id, c.chapterID);
+              case DownloadOutcome.retrySoon:
+                // Transient (5xx, other non-success): stop this pass, retry soon.
+                print("Retrying chapter ${c.chapterID} (${c.name}) soon: HTTP ${resp.statusCode}");
+                backoff = const Duration(seconds: 5);
+                break;
+              case DownloadOutcome.retrySlow:
+                // Blocked or rate limited, not gone: keep the queue intact.
+                print("Site blocked/limited chapter fetch (${resp.statusCode}); keeping queue");
+                backoff = const Duration(seconds: 60);
+                break;
             }
-            await db.saveChapter(c.site, c.id, c.number, c.chapterID, data.content!, data.name);
+            if (outcome == DownloadOutcome.retrySoon || outcome == DownloadOutcome.retrySlow) {
+              break; // rest of the pass would hit the same wall
+            }
           } on SiteBlocked {
+            // Blocked, not gone: keep the queue intact and back off.
             backoff = const Duration(seconds: 60);
             break;
           } catch (e) {
             if (e is Error) {
-              // Chapter-specific parse failure (missing content node):
-              // retrying the same HTML can never succeed — dequeue it.
+              // The API layer already screens out challenge pages and
+              // non-success responses, so an Error here is a *200 page*
+              // whose content node is missing: retrying the same HTML can
+              // never succeed — dequeue just this chapter.
               print("Could not parse chapter ${c.chapterID} (${c.name}): $e");
               await db.dequeueChapterByID(c.site, c.id, c.chapterID);
               continue;

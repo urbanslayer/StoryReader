@@ -16,10 +16,24 @@ import 'package:async/async.dart';
 
 part 'sh.chopper.dart';
 
+/// Builds the typed [SiteBlocked] both ScribbleHub call sites throw when an
+/// anti-bot challenge (Cloudflare today, Anubis if it ever appears) answers
+/// instead of content.
+SiteBlocked _shBlocked(String url, int statusCode, String body) => SiteBlocked(
+      url,
+      statusCode: statusCode,
+      kind: botChallengeKind(statusCode, body),
+      siteName: "ScribbleHub",
+    );
+
 @ChopperApi(baseUrl: "https://www.scribblehub.com/")
 abstract class SHAPI extends ChopperService {
   Future<Response<List<SeriesData>>> simpleSearch(String name) async {
     var resp = await _base({"action": "wi_ajaxsearchmain", "strOne": name, "strType": "series"});
+    if (isBotChallenge(resp.statusCode, resp.bodyString)) {
+      throw _shBlocked("https://www.scribblehub.com/wp-admin/admin-ajax.php",
+          resp.statusCode, resp.bodyString);
+    }
     if (!resp.isSuccessful) {
       return resp.copyWith();
     }
@@ -62,8 +76,8 @@ abstract class SHAPI extends ChopperService {
   /// Both endpoints list chapters newest-first, so the returned
   /// [Response.body] keeps the historical contract of this method and is
   /// **descending (newest-first)** — `series_net_page.dart` reverses it for
-  /// display. Throws [SiteBlocked] when the site answered with a Cloudflare
-  /// interstitial (and nothing could be salvaged from the pagination
+  /// display. Throws [SiteBlocked] when the site answered with an anti-bot
+  /// challenge (and nothing could be salvaged from the pagination
   /// fallback), instead of a bare [HttpException].
   Future<Response<List<ChapterData>>> chapters(String id,
       {Duration tocPageDelay = const Duration(milliseconds: 750)}) async {
@@ -71,9 +85,9 @@ abstract class SHAPI extends ChopperService {
     SiteBlocked? blocked;
     try {
       var resp = await _base({"action": "wi_gettocchp", "strSID": id});
-      if (isCloudflareInterstitial(resp.statusCode, resp.bodyString)) {
-        blocked = SiteBlocked("https://www.scribblehub.com/wp-admin/admin-ajax.php",
-            statusCode: resp.statusCode);
+      if (isBotChallenge(resp.statusCode, resp.bodyString)) {
+        blocked = _shBlocked("https://www.scribblehub.com/wp-admin/admin-ajax.php",
+            resp.statusCode, resp.bodyString);
       } else if (resp.isSuccessful) {
         var parsed = parseScribbleHubToc(resp.bodyString);
         if (parsed.length > 1) {
@@ -107,8 +121,8 @@ abstract class SHAPI extends ChopperService {
       } catch (e) {
         break; // network failure: don't retry endlessly here, RetryInterceptor already did
       }
-      if (isCloudflareInterstitial(resp.statusCode, resp.bodyString)) {
-        blocked = SiteBlocked("$pageUrl?toc=$toc", statusCode: resp.statusCode);
+      if (isBotChallenge(resp.statusCode, resp.bodyString)) {
+        blocked = _shBlocked("$pageUrl?toc=$toc", resp.statusCode, resp.bodyString);
         break;
       }
       if (!resp.isSuccessful) {
@@ -146,6 +160,10 @@ abstract class SHAPI extends ChopperService {
 
   Future<Response<ChapterData>> chapterContents(SeriesData series, String id) async {
     var resp = await _chapterContents("${series.id}-${slugify(series.name)}", id);
+    if (isBotChallenge(resp.statusCode, resp.bodyString)) {
+      throw _shBlocked("https://www.scribblehub.com/read/${series.id}/chapter/$id/",
+          resp.statusCode, resp.bodyString);
+    }
     if (!resp.isSuccessful) {
       return resp.copyWith();
     }
@@ -160,6 +178,10 @@ abstract class SHAPI extends ChopperService {
 
   Future<Response<SeriesData>> series(String id, String name) async {
     var resp = await _series(id, slugify(name));
+    if (isBotChallenge(resp.statusCode, resp.bodyString)) {
+      throw _shBlocked("https://www.scribblehub.com/series/$id/",
+          resp.statusCode, resp.bodyString);
+    }
     if (!resp.isSuccessful) {
       return resp.copyWith();
     }
@@ -201,7 +223,9 @@ abstract class SHAPI extends ChopperService {
             thumbnail: thumbnail));
   }
 
-  static SHAPI create() => _$SHAPI(_shC);
+  /// Builds an API instance. [client] is only for tests (fixture-replaying
+  /// clients); production uses the shared, retrying site client.
+  static SHAPI create([ChopperClient? client]) => _$SHAPI(client ?? _shC);
 }
 
 final _shC = ChopperClient(client: httpClient(), interceptors: [RetryInterceptor()]);

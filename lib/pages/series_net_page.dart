@@ -35,8 +35,8 @@ class _SeriesNetPageState extends State<SeriesNetPage> {
   /// exist.
   bool inLibrary = false;
 
-  /// Non-null when ScribbleHub answered with a Cloudflare interstitial:
-  /// show an inline message instead of silently popping.
+  /// Non-null when the site answered with an anti-bot challenge (Cloudflare
+  /// or Anubis): show an inline message instead of silently popping.
   String? blockedMessage;
 
   /// Applies a freshly-fetched ascending TOC: reconciles the stored chapters
@@ -56,16 +56,25 @@ class _SeriesNetPageState extends State<SeriesNetPage> {
     });
   }
 
+  /// Surfaces a [SiteBlocked] as the inline blocked message (safe to call
+  /// before the first build: pre-mount assignments are picked up by it).
+  void _showBlocked(SiteBlocked d) {
+    if (blockedMessage != null) {
+      return;
+    }
+    if (mounted) {
+      setState(() => blockedMessage = d.userMessage);
+    } else {
+      blockedMessage = d.userMessage;
+    }
+  }
+
   /// Error handler for the TOC fetches: a blocked site is surfaced to the
-  /// user; everything else keeps the historical pop-to-behaviour.
+  /// user (naming the site and the challenge system); everything else keeps
+  /// the historical pop-to-behaviour.
   void _onTocError(Object d, StackTrace t) {
     if (d is SiteBlocked) {
-      if (mounted) {
-        setState(() {
-          blockedMessage =
-              "ScribbleHub blocked the request (Cloudflare). Try again later.";
-        });
-      }
+      _showBlocked(d);
       return;
     }
     if (!errored) {
@@ -99,7 +108,9 @@ class _SeriesNetPageState extends State<SeriesNetPage> {
           await _setThumbnail(thumbnail);
           return b;
         }).onError((d, t) {
-          if (! errored) {
+          if (d is SiteBlocked) {
+            _showBlocked(d);
+          } else if (! errored) {
             errored = true;
             Future.microtask(() async => router.pop());
           }
@@ -123,7 +134,9 @@ class _SeriesNetPageState extends State<SeriesNetPage> {
           await _applyToc(cl);
           return s;
         }).onError((d, t) {
-          if (! errored) {
+          if (d is SiteBlocked) {
+            _showBlocked(d);
+          } else if (! errored) {
             errored = true;
             Future.microtask(() async => router.pop());
           }

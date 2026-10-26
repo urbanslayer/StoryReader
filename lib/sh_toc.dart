@@ -1,5 +1,5 @@
 // Pure (no `package:flutter/...` imports) parsing of ScribbleHub tables of
-// contents, plus Cloudflare-interstitial detection.
+// contents, plus anti-bot challenge detection (Cloudflare *and* Anubis).
 //
 // ScribbleHub serves the chapter list in two shapes:
 //
@@ -21,36 +21,97 @@ import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
 import 'package:story_reader/series_data.dart';
 
-/// A site (Cloudflare in front of it) answered with an anti-bot interstitial
+/// Which anti-bot system answered with a challenge instead of content.
+enum BotChallengeKind { cloudflare, anubis }
+
+/// A site (anti-bot wall in front of it) answered with a challenge page
 /// instead of content. Distinguishable from a bare network failure so the UI
-/// can tell the user "the site blocked the request".
+/// can tell the user "the site blocked the request", and carries [kind] /
+/// [siteName] so the message can name the site and the challenge system
+/// (e.g. "RoyalRoad is asking for a browser check (Anubis)").
 final class SiteBlocked implements Exception {
-  /// The URL that returned the interstitial.
+  /// The URL that returned the challenge page.
   final String url;
 
-  /// HTTP status seen, when known (usually 403, sometimes 429/503).
+  /// HTTP status seen, when known (Cloudflare usually 403, Anubis 200).
   final int? statusCode;
 
-  const SiteBlocked(this.url, {this.statusCode});
+  /// Which anti-bot system produced the page, when recognised.
+  final BotChallengeKind? kind;
+
+  /// Name of the site that produced the page, when known.
+  final String? siteName;
+
+  const SiteBlocked(this.url, {this.statusCode, this.kind, this.siteName});
+
+  /// User-facing explanation naming the site and the challenge system.
+  String get userMessage {
+    final site = siteName ?? "The site";
+    return switch (kind) {
+      BotChallengeKind.cloudflare =>
+        "$site is asking for a browser check (Cloudflare). Try again later.",
+      BotChallengeKind.anubis =>
+        "$site is asking for a browser check (Anubis). Try again later.",
+      null => "$site blocked the request. Try again later.",
+    };
+  }
 
   @override
   String toString() =>
-      "SiteBlocked{url: $url, statusCode: $statusCode}";
+      "SiteBlocked{url: $url, statusCode: $statusCode, kind: $kind, siteName: $siteName}";
 }
 
 /// Whether a response looks like a Cloudflare challenge/error page rather than
 /// real content: an HTTP 403, or a body carrying the classic interstitial
 /// titles ("Just a moment…", "Attention Required! | Cloudflare").
-bool isCloudflareInterstitial(int? statusCode, String body) {
-  if (statusCode == 403) {
-    return true;
-  }
-  // Cheap scan of the head of the document, where the title lives.
+bool isCloudflareInterstitial(int? statusCode, String body) =>
+    statusCode == 403 || _cloudflareMarkers(body);
+
+/// Whether the body carries Cloudflare interstitial markers (title scan of
+/// the head of the document, where the title lives).
+bool _cloudflareMarkers(String body) {
   final head = body.length > 4096 ? body.substring(0, 4096) : body;
   final lower = head.toLowerCase();
   return lower.contains("just a moment") ||
       lower.contains("attention required");
 }
+
+/// Whether the body carries Anubis (github.com/TecharoHQ/anubis) challenge
+/// markers. Anubis answers with HTTP **200**, so status codes never help;
+/// only the page contents identify it. Measured live against RoyalRoad
+/// (2026-10): title "Making sure you&#39;re not a bot!" plus
+/// `<script id="anubis_version">` / `<script id="anubis_challenge">` JSON
+/// blobs (`{"rules":{"algorithm":"fast","difficulty":4},...}`).
+bool _isAnubisBody(String body) {
+  final head = body.length > 8192 ? body.substring(0, 8192) : body;
+  final lower = head.toLowerCase();
+  if (lower.contains("anubis_challenge") || lower.contains("anubis_version")) {
+    return true;
+  }
+  // The exact challenge title, apostrophe HTML-escaped (`you&#39;re`) or not.
+  // Require both halves so a chapter that merely mentions "not a bot" in its
+  // first kilobytes cannot trip this.
+  return lower.contains("making sure you") && lower.contains("not a bot");
+}
+
+/// Which anti-bot challenge (if any) a response carries. Anubis is checked
+/// first: it arrives with status 200, so the Cloudflare status rule must not
+/// shadow it, and a body scan distinguishes them anyway.
+BotChallengeKind? botChallengeKind(int? statusCode, String? body) {
+  if (_isAnubisBody(body ?? "")) {
+    return BotChallengeKind.anubis;
+  }
+  if (statusCode == 403 || _cloudflareMarkers(body ?? "")) {
+    return BotChallengeKind.cloudflare;
+  }
+  return null;
+}
+
+/// Whether a response is an anti-bot challenge page (Cloudflare or Anubis)
+/// rather than real content. Unlike [isCloudflareInterstitial] this also
+/// catches Anubis pages, which RoyalRoad serves with HTTP 200.
+bool isBotChallenge(int? statusCode, String? body) =>
+    botChallengeKind(statusCode, body) != null;
 
 /// Matches the site-stable chapter id inside a chapter URL such as
 /// `https://www.scribblehub.com/read/623932-<slug>/chapter/2640407/`.
