@@ -315,49 +315,121 @@ class AppDB extends _$AppDB {
     });
   }
 
-  // ---- Legacy (upstream v10) library import ------------------------------
+  // ---- Legacy (upstream schema 2..10) library import ----------------------
   // See repairLegacyChapters / promoteLastReadMarkers at the bottom of this
   // file for the shared repair logic. Nothing here changes the schema.
 
   /// Imports a full library payload exported by the **original upstream
-  /// StoryReader** (DB schema v10) through the network share: the JSON shape
-  /// is `{series, chapters, chapterImages}` of drift `toJson()` rows, but
-  /// without the v11 columns (`position`, `chapterNumber`, `upstreamState`,
-  /// `isRead`, `lastReadChapterID`).
+  /// StoryReader** at DB schema [sourceSchema] (2..10) through the network
+  /// share.
   ///
-  /// The rows are converted to the current schema and repaired with **the
-  /// same rules as the v10→v11 migration** ([repairLegacyChapters] +
-  /// [promoteLastReadMarkers]), then the whole DB is replaced inside one
-  /// transaction, exactly like [replaceDB]. Returns per-repair counts.
-  Future<LegacyImportReport> importLegacyV10Library(Map<String, dynamic> payload) async {
-    var seriesRows = (payload["series"] as List? ?? const [])
-        .cast<Map<String, dynamic>>()
-        .map(_seriesFromV10Json)
-        .toList();
-    var chapterRows = (payload["chapters"] as List? ?? const [])
-        .cast<Map<String, dynamic>>()
-        .map(_chapterFromV10Json)
-        .toList();
-    var imageRows = (payload["chapterImages"] as List? ?? const [])
-        .cast<Map<String, dynamic>>()
-        .map(_chapterImageFromV10Json)
-        .toList();
+  /// Rather than hand-converting every historical row shape, the payload rows
+  /// are inserted into a fresh in-memory database carrying the **exact
+  /// upstream DDL of [sourceSchema]** ([upstreamSchemaDdl]) with
+  /// `PRAGMA user_version = sourceSchema`, and [AppDB] is opened on top of it
+  /// so **the real [migration] chain runs** (gzip conversion, HTML→RichText
+  /// conversion, image registration, spacing/trim passes, the v11 identity
+  /// repair and index, …) up to the current [schemaVersion]. The migrated
+  /// rows are then read back and [replaceDB]'d into the live DB in one
+  /// transaction. Returns per-repair counts including the source schema.
+  Future<LegacyImportReport> importLegacyLibrary(
+      Map<String, dynamic> payload, {required int sourceSchema}) async {
+    var migrated = await migrateUpstreamPayload(payload, sourceSchema);
+    await replaceDB(migrated.series, migrated.chapters, migrated.images);
 
-    var repair = repairLegacyChapters(chapterRows);
-    var promoted = promoteLastReadMarkers(seriesRows, repair.kept);
-    seriesRows = [
-      for (var s in seriesRows) s.copyWith(lastReadChapterID: Value(promoted[(s.site, s.id)])),
-    ];
-
-    await replaceDB(seriesRows, repair.kept, imageRows);
+    // The repair ran inside the temp DB's migration; recount its effects
+    // from the payload input vs. the migrated output (same rules as
+    // repairLegacyChapters: blank '' content-less rows are dropped, then one
+    // row per (site, id, chapterID) survives).
+    var rawChapters =
+        (payload["chapters"] as List? ?? const []).cast<Map<String, dynamic>>();
+    var droppedBlank = rawChapters
+        .where((j) => (j["chapterID"] as String? ?? "").isEmpty && j["content"] == null)
+        .length;
+    var identified = rawChapters.length - droppedBlank;
+    var kept = migrated.chapters.length;
     return LegacyImportReport(
-      series: seriesRows.length,
-      chapters: repair.kept.length,
-      chaptersWithContent: repair.kept.where((c) => c.content != null).length,
-      droppedBlankRows: repair.droppedBlank,
-      dedupedRows: repair.deduped,
-      lastReadMarkersPromoted: promoted.length,
+      sourceSchema: sourceSchema,
+      series: migrated.series.length,
+      chapters: kept,
+      chaptersWithContent: migrated.chapters.where((c) => c.content != null).length,
+      droppedBlankRows: droppedBlank,
+      dedupedRows: identified - kept,
+      lastReadMarkersPromoted:
+          migrated.series.where((s) => s.lastReadChapterID != null).length,
     );
+  }
+
+  /// Compatibility wrapper: import an upstream **schema 10** payload (the
+  /// shape documented in the original 0.9.x share protocol).
+  Future<LegacyImportReport> importLegacyV10Library(Map<String, dynamic> payload) =>
+      importLegacyLibrary(payload, sourceSchema: 10);
+
+  /// Builds a throwaway database with the exact upstream DDL for
+  /// [sourceSchema], inserts the payload rows (drift `toJson()` shapes —
+  /// see [_legacyBlob] / [_legacyDateTime]), and opens an [AppDB] on it so
+  /// drift's migration chain upgrades it to the current [schemaVersion].
+  /// Returns the migrated rows.
+  Future<({List<Series> series, List<Chapter> chapters, List<ChapterImage> images})>
+      migrateUpstreamPayload(Map<String, dynamic> payload, int sourceSchema) async {
+    var ddl = upstreamSchemaDdl(sourceSchema);
+    var raw = sqlite3.openInMemory();
+    try {
+      for (var stmt in ddl) {
+        raw.execute(stmt);
+      }
+      raw.execute("PRAGMA user_version = $sourceSchema");
+
+      for (var j in (payload["series"] as List? ?? const []).cast<Map<String, dynamic>>()) {
+        raw.execute(_seriesInsertStatement(sourceSchema), _seriesInsertArgs(j, sourceSchema));
+      }
+      for (var j in (payload["chapters"] as List? ?? const []).cast<Map<String, dynamic>>()) {
+        raw.execute(_chapterInsertStatement(sourceSchema), _chapterInsertArgs(j, sourceSchema));
+      }
+      if (sourceSchema >= 5) {
+        for (var j in (payload["chapterImages"] as List? ?? const [])
+            .cast<Map<String, dynamic>>()) {
+          raw.execute(_imageInsertStatement(sourceSchema), _imageInsertArgs(j, sourceSchema));
+        }
+      }
+
+      // Drift sees user_version = sourceSchema < schemaVersion and runs
+      // onUpgrade(sourceSchema -> current) on first access.
+      var migrated = AppDB(NativeDatabase.opened(raw, closeUnderlyingOnClose: false));
+      try {
+        return (
+          series: await migrated.select(migrated.seriesTable).get(),
+          chapters: await migrated.select(migrated.chapters).get(),
+          images: await migrated.select(migrated.chapterImages).get(),
+        );
+      } finally {
+        await migrated.close();
+      }
+    } finally {
+      raw.dispose();
+    }
+  }
+
+  /// Whether [column] currently exists on [table] (guards every `addColumn`
+  /// in [migration] against "duplicate column" when an earlier step created
+  /// the table with the *current* definition).
+  Future<bool> columnExists(String table, String column) async {
+    var rows = await customSelect(
+      "SELECT 1 FROM pragma_table_info(?) WHERE name = ?",
+      variables: [Variable.withString(table), Variable.withString(column)],
+      readsFrom: {seriesTable, chapters, chapterImages},
+    ).get();
+    return rows.isNotEmpty;
+  }
+
+  /// Whether a table exists in the current database file.
+  Future<bool> tableExists(String table) async {
+    var rows = await customSelect(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+      variables: [Variable.withString(table)],
+      readsFrom: {seriesTable, chapters, chapterImages},
+    ).get();
+    return rows.isNotEmpty;
   }
   // ---- end legacy import --------------------------------------------------
 
@@ -1056,20 +1128,50 @@ class AppDB extends _$AppDB {
       await m.createAll();
       await customStatement(_uniqueChapterIndexStatement);
     }, onUpgrade: (Migrator m, int from, int to) async {
-      if (from < 12) {
+      // The v11/v12 columns are added **first**: several historical data
+      // steps below (from<4, from==6||7, from<6, from<10) read and rewrite
+      // whole `chapters`/`series` rows through drift's *current* generated
+      // row classes, so every current column must exist before any of them
+      // runs. Each addColumn is guarded with a PRAGMA check because a
+      // createTable below (from<5) already creates tables with the current
+      // definition, and re-running migrations against partially-upgraded
+      // databases must stay safe.
+      if (from < 12 && !await columnExists("chapters", "raw_html")) {
         // M3b — raw source HTML for lossless EPUB export. Nullable column,
         // old chapters keep null and export falls back to the RichText tree.
-        // Added *first* because several older migration steps rewrite whole
-        // rows (batch.replaceAll/replace) against the current column set.
         await m.addColumn(chapters, chapters.rawHtml);
       }
+      if (from < 11) {
+        // M1 — stable chapter identity. All new columns are defaulted or
+        // nullable, so no table rebuild is needed. The *data* part of M1
+        // (repair + index) runs at the end, after the historical steps.
+        if (!await columnExists("chapters", "position")) {
+          await m.addColumn(chapters, chapters.position);
+        }
+        if (!await columnExists("chapters", "chapter_number")) {
+          await m.addColumn(chapters, chapters.chapterNumber);
+        }
+        if (!await columnExists("chapters", "upstream_state")) {
+          await m.addColumn(chapters, chapters.upstreamState);
+        }
+        if (!await columnExists("chapters", "is_read")) {
+          await m.addColumn(chapters, chapters.isRead);
+        }
+        if (!await columnExists("series", "last_read_chapter_i_d")) {
+          await m.addColumn(seriesTable, seriesTable.lastReadChapterID);
+        }
+      }
       await transaction(() async {
-        if (from < 2) {
+        if (from < 2 && !await columnExists("series", "last_read_date")) {
           await m.addColumn(seriesTable, seriesTable.lastReadDate);
         }
         if (from < 3) {
-          await m.addColumn(seriesTable, seriesTable.thumbnailWidth);
-          await m.addColumn(seriesTable, seriesTable.thumbnailHeight);
+          if (!await columnExists("series", "thumbnail_width")) {
+            await m.addColumn(seriesTable, seriesTable.thumbnailWidth);
+          }
+          if (!await columnExists("series", "thumbnail_height")) {
+            await m.addColumn(seriesTable, seriesTable.thumbnailHeight);
+          }
         }
         if (from < 4) {
           await m.alterTable(TableMigration(chapters, columnTransformer: {chapters.content: chapters.content.cast<Uint8List>()}));
@@ -1088,12 +1190,18 @@ class AppDB extends _$AppDB {
       if (from < 4) {
         await vacuum();
       }
-      if (from < 5) {
+      if (from < 5 && !await tableExists("images")) {
         await m.createTable(chapterImages);
       }
-      if (from < 7) {
+      if (from < 7 && !await columnExists("images", "should_download")) {
+        // When upgrading from <5 the createTable above already used the
+        // current definition (should_download included) — the guard keeps
+        // this from failing with "duplicate column".
         await m.addColumn(chapterImages, chapterImages.shouldDownload);
       }
+      // from == 6/7 must run *before* the from<6 HTML→RichText conversion
+      // only for DBs that already hold RichText (v6+); a from<6 database
+      // skips it and gets its spacing from RichTextDocument.html itself.
       if (from == 6 || from == 7) {
         var cs = await Future.wait((await select(chapters).get()).map((c) async {
           if (c.content != null) {
@@ -1109,6 +1217,8 @@ class AppDB extends _$AppDB {
         });
       }
       if (from < 6) {
+        // HTML → RichText. `addImage` below registers the chapter's images,
+        // so the images table must exist (created by the from<5 step above).
         var cs = await Future.wait((await select(chapters).get()).map((c) async {
           if (c.content != null) {
             var content = _utf8.decode(_gzip.decode(c.content!));
@@ -1143,18 +1253,11 @@ class AppDB extends _$AppDB {
         });
       }
       if (from < 11) {
-        // M1 — stable chapter identity. All new columns are defaulted or
-        // nullable, so no table rebuild is needed.
-        await m.addColumn(chapters, chapters.position);
-        await m.addColumn(chapters, chapters.chapterNumber);
-        await m.addColumn(chapters, chapters.upstreamState);
-        await m.addColumn(chapters, chapters.isRead);
-        await m.addColumn(seriesTable, seriesTable.lastReadChapterID);
-
-        // Everything the v10 row shape needs (see the long comment in
-        // [repairLegacyChapters]) is exactly what importing an upstream v10
-        // payload needs too, so the repair lives in that one pure function
-        // and the migration just applies it to the live table.
+        // M1 data repair (the columns were added at the start of this
+        // strategy). Everything the legacy row shape needs (see the long
+        // comment in [repairLegacyChapters]) is exactly what importing an
+        // upstream payload needs too, so the repair lives in that one pure
+        // function and the migration just applies it to the live table.
         var repair = repairLegacyChapters(await select(chapters).get());
         await delete(chapters).go();
         await batch((b) {
@@ -1289,8 +1392,10 @@ Map<(Site, String), String> promoteLastReadMarkers(List<Series> series, List<Cha
   return out;
 }
 
-/// Per-repair counts returned by [AppDB.importLegacyV10Library].
+/// Per-repair counts returned by [AppDB.importLegacyLibrary].
 class LegacyImportReport {
+  /// The upstream DB schema the payload was announced/imported at (2..10).
+  final int sourceSchema;
   final int series;
   final int chapters;
   final int chaptersWithContent;
@@ -1299,6 +1404,7 @@ class LegacyImportReport {
   final int lastReadMarkersPromoted;
 
   const LegacyImportReport({
+    required this.sourceSchema,
     required this.series,
     required this.chapters,
     required this.chaptersWithContent,
@@ -1309,14 +1415,127 @@ class LegacyImportReport {
 
   @override
   String toString() =>
-      "$series series, $chapters chapters ($chaptersWithContent with content), "
+      "format $sourceSchema: $series series, $chapters chapters ($chaptersWithContent with content), "
       "$droppedBlankRows blank rows dropped, $dedupedRows duplicates removed, "
       "$lastReadMarkersPromoted last-read markers promoted";
 }
 
-// v10 JSON value helpers. Drift's default ValueSerializer encodes blobs as
-// plain JSON int arrays and DateTimes as epoch millis (older/newer drift
-// variants use base64 strings / ISO-8601 — accept both shapes).
+// ===========================================================================
+// Upstream (original StoryReader) schema 2..10 DDL + payload inserts.
+//
+// The upstream commits that shipped each schemaVersion (from
+// `git log -L '/int get schemaVersion/,+1:lib/db.dart' upstream/main`), used
+// to transcribe the drift-generated `CREATE TABLE` statements per version:
+//   2:  e013160 "Init"                      (GitHub release 0.9.0)
+//   3:  c410d8c RoyalRoad + thumbnail size  (chapters.name NOT NULL)
+//   4:  b10af17 content compression         (GitHub release 0.9.1)
+//   5:  fd57983 images table
+//   6:  f135d26 RichText conversion         (content becomes RichText JSON)
+//   7:  bcccb17 images.should_download
+//   8:  dea7d96, 9: 42d10a1, 10: b53552e    (data-only migrations)
+// ===========================================================================
+
+/// The `CREATE TABLE` statements of the original upstream StoryReader at
+/// schema [n] (2..10), in drift's snake_case column naming (drift-generated
+/// DDL for `chapterID` is `chapter_i_d`). Column names, order, nullability
+/// and primary keys match the upstream table definitions of that version:
+///
+/// * `series` gains `thumbnail_width`/`thumbnail_height` at v3.
+/// * `chapters.name` becomes `NOT NULL` at v3; `content` is raw HTML `TEXT`
+///   until v3 and gzip-compressed `BLOB` from v4 (the fork's from<4 migration
+///   step does exactly that conversion).
+/// * `images` exists from v5 and gains `should_download` at v7.
+///
+/// Only used to build throwaway databases that [AppDB] then migrates to the
+/// current schema — it is never applied to a user database.
+List<String> upstreamSchemaDdl(int n) {
+  if (n < 2 || n > 10) {
+    throw FormatException("Unsupported upstream schema version: $n");
+  }
+  final seriesDims = n >= 3 ? ", thumbnail_width INTEGER, thumbnail_height INTEGER" : "";
+  final name = n >= 3 ? "name TEXT NOT NULL" : "name TEXT";
+  final content = n >= 4 ? "content BLOB" : "content TEXT";
+  return [
+    "CREATE TABLE series (site INTEGER NOT NULL, id TEXT NOT NULL, name TEXT NOT NULL, "
+        "description TEXT NOT NULL, thumbnail BLOB, last_read INTEGER, last_read_date INTEGER"
+        "$seriesDims, PRIMARY KEY (id, site))",
+    "CREATE TABLE chapters (site INTEGER NOT NULL, id TEXT NOT NULL, number INTEGER NOT NULL, "
+        "chapter_i_d TEXT NOT NULL, $name, $content, scroll_position INTEGER, "
+        "queued INTEGER NOT NULL, PRIMARY KEY (site, id, number))",
+    if (n >= 5)
+      "CREATE TABLE images (id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL UNIQUE, "
+          "image BLOB${n >= 7 ? ", should_download INTEGER NOT NULL DEFAULT true" : ""})",
+  ];
+}
+
+String _seriesInsertStatement(int n) =>
+    "INSERT INTO series (site, id, name, description, thumbnail, last_read, last_read_date"
+    "${n >= 3 ? ", thumbnail_width, thumbnail_height" : ""}) VALUES ("
+    "${List.filled(n >= 3 ? 9 : 7, "?").join(", ")})";
+
+List<Object?> _seriesInsertArgs(Map<String, dynamic> j, int n) => [
+      j["site"] as int,
+      j["id"] as String,
+      j["name"] as String,
+      j["description"] as String,
+      _legacyBlob(j["thumbnail"]),
+      j["lastRead"] as int?,
+      // Drift stores DateTime columns as unix SECONDS (toJson emits millis —
+      // convert here so drift reads the same instant back).
+      _legacySeconds(j["lastReadDate"]),
+      if (n >= 3) j["thumbnailWidth"] as int?,
+      if (n >= 3) j["thumbnailHeight"] as int?,
+    ];
+
+String _chapterInsertStatement(int n) =>
+    "INSERT INTO chapters (site, id, number, chapter_i_d, name, content, scroll_position, "
+    "queued) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+
+List<Object?> _chapterInsertArgs(Map<String, dynamic> j, int n) => [
+      j["site"] as int,
+      j["id"] as String,
+      j["number"] as int,
+      // v2-era placeholder rows could carry a NULL chapterID; treat it as ''.
+      j["chapterID"] as String? ?? "",
+      // v2's chapters.name was nullable and the old app left it NULL on
+      // placeholder rows; the later table rebuilds require NOT NULL.
+      j["name"] as String? ?? "",
+      _chapterContentValue(j["content"], n),
+      j["scrollPosition"] as int?,
+      _legacyBool(j["queued"], false) ? 1 : 0,
+    ];
+
+/// `content` per schema: TEXT (the raw HTML string) below v4, gzip BLOB
+/// from v4 on. Accepts both the JSON string and the blob int-array shape
+/// regardless of schema, to be forgiving about serializer variants.
+Object? _chapterContentValue(dynamic v, int n) {
+  if (v == null) {
+    return null;
+  }
+  if (n < 4) {
+    if (v is String) {
+      return v;
+    }
+    return _utf8.decode(_legacyBlob(v)!);
+  }
+  return _legacyBlob(v);
+}
+
+String _imageInsertStatement(int n) => n >= 7
+    ? "INSERT INTO images (id, url, image, should_download) VALUES (?, ?, ?, ?)"
+    : "INSERT INTO images (id, url, image) VALUES (?, ?, ?)";
+
+List<Object?> _imageInsertArgs(Map<String, dynamic> j, int n) => [
+      j["id"] as int,
+      j["url"] as String,
+      _legacyBlob(j["image"]),
+      if (n >= 7) _legacyBool(j["shouldDownload"], true) ? 1 : 0,
+    ];
+
+// v10 JSON value helpers. Drift's default ValueSerializer (verified in both
+// the upstream-pinned drift 2.20.0 and this fork's drift 2.28.0) encodes
+// blobs as plain JSON int arrays and DateTimes as epoch millis; some older/
+// newer drift variants use base64 strings / ISO-8601 — accept both shapes.
 
 Uint8List? _legacyBlob(dynamic v) {
   if (v == null) {
@@ -1344,6 +1563,14 @@ DateTime? _legacyDateTime(dynamic v) {
   return DateTime.parse(v.toString());
 }
 
+/// Drift's DB representation of a DateTime column is unix *seconds*; the
+/// share JSON carries `toJson()` millis (or an ISO string). Convert to the
+/// storage form used when inserting into the temp upstream database.
+int? _legacySeconds(dynamic v) {
+  var d = _legacyDateTime(v);
+  return d == null ? null : d.millisecondsSinceEpoch ~/ 1000;
+}
+
 bool _legacyBool(dynamic v, bool fallback) {
   if (v == null) {
     return fallback;
@@ -1353,38 +1580,3 @@ bool _legacyBool(dynamic v, bool fallback) {
   }
   return (v as int) != 0;
 }
-
-Series _seriesFromV10Json(Map<String, dynamic> j) => Series(
-      site: Site.values[j["site"] as int],
-      id: j["id"] as String,
-      name: j["name"] as String,
-      description: j["description"] as String,
-      thumbnail: _legacyBlob(j["thumbnail"]),
-      lastRead: j["lastRead"] as int?,
-      lastReadDate: _legacyDateTime(j["lastReadDate"]),
-      thumbnailWidth: j["thumbnailWidth"] as int?,
-      thumbnailHeight: j["thumbnailHeight"] as int?,
-    );
-
-Chapter _chapterFromV10Json(Map<String, dynamic> j) => Chapter(
-      site: Site.values[j["site"] as int],
-      id: j["id"] as String,
-      number: j["number"] as int,
-      chapterID: j["chapterID"] as String,
-      name: j["name"] as String,
-      content: _legacyBlob(j["content"]),
-      scrollPosition: j["scrollPosition"] as int?,
-      queued: _legacyBool(j["queued"], false),
-      // v11 columns, fixed up by repairLegacyChapters / defaults:
-      position: j["number"] as int,
-      chapterNumber: parseChapterNumber(j["name"] as String),
-      upstreamState: ChapterUpstreamState.upstream,
-      isRead: false,
-    );
-
-ChapterImage _chapterImageFromV10Json(Map<String, dynamic> j) => ChapterImage(
-      id: j["id"] as int,
-      url: j["url"] as String,
-      image: _legacyBlob(j["image"]),
-      shouldDownload: _legacyBool(j["shouldDownload"], true),
-    );

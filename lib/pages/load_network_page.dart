@@ -3,33 +3,39 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:story_reader/db.dart';
 import 'package:story_reader/main.dart';
 import 'package:story_reader/network_form.dart';
 import 'package:story_reader/port_scan.dart';
 
-/// Where the exporting (sharing) app runs and which schema it speaks. The
-/// sender validates the `X-Schema` header against its own `schemaVersion`, so
-/// the receiver must announce the sender's version — not its own — when
-/// importing from the original upstream app (schema v10). The sender allows
-/// exactly ONE request per sharing session (a rejected one consumes it too),
-/// so there is no automatic retry: the version is chosen up front.
+/// Where the exporting (sharing) app runs and which library format it speaks.
+/// The sender validates the `X-Schema` header against its own `schemaVersion`
+/// and allows exactly ONE request per sharing session (a rejected one consumes
+/// it too). The fork's own format is known, so [LoadSource.forkRemote] just
+/// announces it. The original upstream app's version is unknown (published
+/// GitHub releases are schema 4 and 2, main-branch builds range up to 10) and
+/// a mismatch is only signalled by "406: Schema mismatch", so for the
+/// original-app sources the page announces one candidate format from
+/// [kOriginalSchemaCandidates] per Load press and cycles to the next
+/// candidate after every 406 — the user re-opens the share screen and presses
+/// Load again until the format matches. "Advanced: library format" lets
+/// users who know their version pin it directly.
 enum LoadSource {
   /// Upstream StoryReader on the SAME phone: it binds 0.0.0.0 on a random
   /// port in 10000..10199, so the fork reaches it on 127.0.0.1 and
   /// auto-discovers the port — only the password has to be typed.
   originalSamePhone,
 
-  /// Upstream StoryReader (F-Droid) on another device, DB schema v10.
+  /// Upstream StoryReader on another device.
   originalRemote,
 
   /// StoryReader+, this fork, on another device.
   forkRemote;
 
-  int get schemaVersion => switch (this) {
-        LoadSource.originalSamePhone || LoadSource.originalRemote => 10,
-        LoadSource.forkRemote => appDB.schemaVersion,
-      };
+  /// Whether this source is the original, upstream app (unknown library
+  /// format, needs the X-Schema candidate cycle).
+  bool get isOriginal => this != LoadSource.forkRemote;
 
   bool get isSamePhone => this == LoadSource.originalSamePhone;
 }
@@ -61,8 +67,32 @@ class _LoadNetworkPageState extends State<LoadNetworkPage> {
   /// screen themselves.
   bool showManualPort = false;
 
+  /// `null` = Auto (cycle through [kOriginalSchemaCandidates] on 406);
+  /// otherwise the format pinned under "Advanced: library format".
+  int? explicitSchema;
+
+  /// Index into [kOriginalSchemaCandidates] of the next format to announce.
+  /// Persisted under [kSchemaCyclePrefKey] so the cycle survives leaving the
+  /// page; reset on a successful import.
+  int cycleIndex = 0;
+
   Future? loading;
   String? error;
+
+  @override
+  void initState() {
+    super.initState();
+    SharedPreferences.getInstance().then((prefs) {
+      if (!mounted) {
+        return;
+      }
+      var stored = prefs.getInt(kSchemaCyclePrefKey);
+      if (stored != null) {
+        setState(() =>
+            cycleIndex = stored.clamp(0, kOriginalSchemaCandidates.length - 1));
+      }
+    });
+  }
 
   @override
   void dispose() {
@@ -72,9 +102,28 @@ class _LoadNetworkPageState extends State<LoadNetworkPage> {
     pwdC.dispose();
   }
 
+  /// The `X-Schema` value announced to the original app on the next attempt.
+  int get effectiveSchema =>
+      explicitSchema ?? kOriginalSchemaCandidates[cycleIndex];
+
+  Future<void> _saveCycle(int index) async {
+    cycleIndex = index.clamp(0, kOriginalSchemaCandidates.length - 1);
+    var prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(kSchemaCyclePrefKey, cycleIndex);
+  }
+
+  Future<void> _resetCycle() async {
+    var prefs = await SharedPreferences.getInstance();
+    await prefs.remove(kSchemaCyclePrefKey);
+    cycleIndex = 0;
+  }
+
   Future<void> _load() async {
     String? failure;
     bool forceManualPort = false;
+    // The format announced this round: the fork knows its own, the original
+    // app gets the current candidate / pinned format.
+    final schema = source.isOriginal ? effectiveSchema : appDB.schemaVersion;
     // Validate everything BEFORE touching the network: the share server
     // burns its one-time session even on a rejected request, and a parse
     // crash (int.parse on an empty field) must never reach the wire.
@@ -91,6 +140,7 @@ class _LoadNetworkPageState extends State<LoadNetworkPage> {
       });
       return;
     }
+    var mismatch406 = false;
     try {
       // Assigned unless `failure` was set; the HTTP call below is skipped then.
       late final String host;
@@ -133,7 +183,7 @@ class _LoadNetworkPageState extends State<LoadNetworkPage> {
         var resp = await http.get(
             Uri(scheme: "http", host: host, port: port),
             headers: {
-              "X-Schema": source.schemaVersion.toString(),
+              "X-Schema": schema.toString(),
               "X-Password": pwdC.text,
             });
         if (resp.statusCode == 200) {
@@ -151,20 +201,54 @@ class _LoadNetworkPageState extends State<LoadNetworkPage> {
                     .map((i) => ChapterImage.fromJson(i as Map<String, dynamic>))
                     .toList());
           } else {
-            await appDB.importLegacyV10Library(data as Map<String, dynamic>);
+            // Replay the announced upstream schema against the real
+            // migration chain, then replace the live library with the result.
+            await appDB.importLegacyLibrary(data as Map<String, dynamic>,
+                sourceSchema: schema);
+            await _resetCycle();
           }
         } else {
           var body = resp.body.trim();
-          failure = "Server answered ${resp.statusCode}"
-              "${body.isEmpty ? "" : ": $body"}.\n"
-              "The Share session on the source app answers only ONE request, even "
-              "a rejected one — start sharing again there before retrying.";
+          if (source.isOriginal && resp.statusCode == 406) {
+            mismatch406 = true;
+          } else {
+            failure = "Server answered ${resp.statusCode}"
+                "${body.isEmpty ? "" : ": $body"}.\n"
+                "The Share session on the source app answers only ONE request, even "
+                "a rejected one — start sharing again there before retrying.";
+          }
         }
       }
     } catch (e) {
       failure = "$e";
     }
     if (!mounted) {
+      return;
+    }
+    if (mismatch406) {
+      // The rejected request consumed the share session; remember the next
+      // candidate format (persisted, survives leaving the page) and tell the
+      // user exactly what to do.
+      if (explicitSchema != null) {
+        // A pinned format stays pinned — the user picks the next one.
+        setState(() {
+          error = schemaMismatchManualMessage(explicitSchema!);
+          loading = null;
+        });
+        return;
+      }
+      var nextIndex = (cycleIndex + 1) % kOriginalSchemaCandidates.length;
+      await _saveCycle(nextIndex);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        error = schemaMismatchCycleMessage(
+            nextSchema: kOriginalSchemaCandidates[nextIndex],
+            nextAttempt: nextIndex + 1,
+            totalAttempts: kOriginalSchemaCandidates.length);
+        loading = null;
+      });
       return;
     }
     if (failure != null) {
@@ -219,6 +303,40 @@ class _LoadNetworkPageState extends State<LoadNetworkPage> {
                   ],
                 ),
               ),
+              if (source.isOriginal) ...[
+                Padding(
+                  padding: const EdgeInsets.all(8.0),
+                  child: Row(
+                    children: [
+                      Text("Advanced: library format:"),
+                      SizedBox(width: 12),
+                      DropdownButton<int?>(
+                        value: explicitSchema,
+                        onChanged: loading == null
+                            ? (v) => setState(() => explicitSchema = v)
+                            : null,
+                        items: [
+                          DropdownMenuItem(
+                              value: null,
+                              child: Text(
+                                  "Auto (cycle ${kOriginalSchemaCandidates.join(", ")})")),
+                          for (var s = 2; s <= 10; s++)
+                            DropdownMenuItem(value: s, child: Text("$s")),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                  child: Text(
+                      explicitSchema != null
+                          ? "Announcing library format $explicitSchema."
+                          : "Announcing library format ${kOriginalSchemaCandidates[cycleIndex]} "
+                              "(attempt ${cycleIndex + 1} of ${kOriginalSchemaCandidates.length}).",
+                      softWrap: true),
+                ),
+              ],
               if (source.isSamePhone) ...[
                 Padding(
                   padding: const EdgeInsets.all(8.0),

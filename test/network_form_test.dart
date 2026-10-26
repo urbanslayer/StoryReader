@@ -155,4 +155,27 @@ void main() {
           isNull);
     });
   });
+
+  group('library format cycle', () {
+    test('candidates cover 2..10 exactly once, starting at the release formats', () {
+      expect(kOriginalSchemaCandidates, [4, 2, 10, 9, 8, 7, 6, 5, 3]);
+      expect(kOriginalSchemaCandidates.toSet().length, 9);
+      expect(kOriginalSchemaCandidates.every((s) => s >= 2 && s <= 10), isTrue);
+    });
+
+    test('406 cycle message names the next format and attempt', () {
+      var msg = schemaMismatchCycleMessage(
+          nextSchema: 2, nextAttempt: 2, totalAttempts: 9);
+      expect(
+          msg,
+          "The original app uses a different library format. Open Share "
+          "library again in the original app (the old session is used up), "
+          "then press Load — trying format 2 next (attempt 2 of 9).");
+    });
+
+    test('pinned-format 406 message tells the user to change the format', () {
+      expect(schemaMismatchManualMessage(10), contains("Format 10 was rejected"));
+      expect(schemaMismatchManualMessage(10), contains("Advanced: library format"));
+    });
+  });
 }

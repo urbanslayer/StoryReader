@@ -44,3 +44,39 @@ String? validateLoadForm({
   }
   return null;
 }
+
+// ---- library-format (X-Schema) cycle --------------------------------------
+//
+// The original app's share server only answers when the announced `X-Schema`
+// equals its own `schemaVersion`, tells nothing beyond "406: Schema
+// mismatch", and burns its one-shot share session on the rejected request.
+// So for the original-app sources the fork announces one candidate format
+// per sharing session and remembers, across page visits, which candidate to
+// try next after every 406.
+
+/// Candidate `X-Schema` values to announce to the original app, ordered by
+/// likelihood: the only published releases are 0.9.1 (schema 4) and 0.9.0
+/// (schema 2); F-Droid/main-branch builds range up to schema 10.
+const List<int> kOriginalSchemaCandidates = [4, 2, 10, 9, 8, 7, 6, 5, 3];
+
+/// Preferences key holding the index into [kOriginalSchemaCandidates] of the
+/// next format to try (persisted so the cycle survives leaving the page; a
+/// successful import resets it).
+const String kSchemaCyclePrefKey = "load.originalSchemaCycleIndex";
+
+/// User-facing guidance shown after a 406 in Auto mode: the old share
+/// session is spent, and [nextSchema] (the [nextAttempt]-th of
+/// [totalAttempts] attempts) is announced on the next Load press.
+String schemaMismatchCycleMessage(
+        {required int nextSchema, required int nextAttempt, required int totalAttempts}) =>
+    "The original app uses a different library format. Open Share library "
+    "again in the original app (the old session is used up), then press "
+    "Load — trying format $nextSchema next "
+    "(attempt $nextAttempt of $totalAttempts).";
+
+/// Guidance shown after a 406 when the user pinned a format manually.
+String schemaMismatchManualMessage(int rejectedSchema) =>
+    "Format $rejectedSchema was rejected (406: Schema mismatch). Open Share "
+    "library again in the original app (the old session is used up), then "
+    "pick another format under \"Advanced: library format\" — or Auto to "
+    "cycle through all formats.";
