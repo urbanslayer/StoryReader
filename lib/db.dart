@@ -711,10 +711,17 @@ class AppDB extends _$AppDB {
 
   /// Aligns stored chapters with the live upstream table of contents.
   ///
+  /// * An empty [toc] is treated as a *failed fetch* (e.g. a Cloudflare
+  ///   interstitial) and ignored: the call is a no-op. A real TOC is never
+  ///   empty for a published series, and honouring one would mark every
+  ///   stored chapter `missingUpstream` and wipe the download queue.
   /// * Live TOC entries are upserted in TOC order (`position = index`,
   ///   `chapterNumber = parseChapterNumber(name)`); a name mismatch marks the
-  ///   row `renamed` but **never touches its content**; a previously missing
-  ///   chapter that reappears returns to `upstream`.
+  ///   row `renamed` but **never touches its content or name** — name and
+  ///   downloaded content must stay paired. Rows with **no content** (plain
+  ///   placeholders or queued rows never downloaded) have nothing to pair
+  ///   with, so they adopt the live title and stay `upstream`. A previously
+  ///   missing chapter that reappears returns to `upstream`.
   /// * Local rows whose `chapterID` is absent from [toc] become
   ///   `missingUpstream` with `position = kNoPosition` and `queued = false`,
   ///   **keeping** their content, scroll position and name — so a deleted
@@ -723,6 +730,10 @@ class AppDB extends _$AppDB {
   /// The `lastReadChapterID` marker is a stable id and needs no adjustment.
   Future<void> reconcileChapters(Site site, String seriesId, List<ChapterData> toc) {
     return transaction(() async {
+      if (toc.isEmpty) {
+        // Failed/blocked fetch, not an empty series: keep all state.
+        return;
+      }
       var existing = await (select(chapters)
             ..where((c) => c.site.equals(site.index) & c.id.equals(seriesId)))
           .get();
@@ -754,12 +765,22 @@ class AppDB extends _$AppDB {
         } else {
           state = row.name != entry.name ? ChapterUpstreamState.renamed : ChapterUpstreamState.upstream;
         }
-        // Name and content are deliberately untouched: `name` stays the local
-        // copy so the renamed state remains detectable until a re-download.
+        var name = const Value<String>.absent();
+        if (row.content == null && row.name != entry.name) {
+          // Content-less placeholder (or queued, never downloaded): there
+          // is no content to keep paired with the old name, so take the
+          // live title instead of staying `renamed` forever.
+          name = Value(entry.name);
+          state = ChapterUpstreamState.upstream;
+        }
+        // `content` is deliberately untouched: for downloaded rows the local
+        // `name` stays the discriminator of the renamed state until a
+        // re-download.
         await (update(chapters)..whereSamePrimaryKey(row)).write(ChaptersCompanion(
               position: Value(i),
               chapterNumber: Value(parsed),
               upstreamState: Value(state),
+              name: name,
             ));
       }
 
@@ -874,6 +895,20 @@ class AppDB extends _$AppDB {
         await m.addColumn(chapters, chapters.isRead);
         await m.addColumn(seriesTable, seriesTable.lastReadChapterID);
 
+        // Upstream v10's `dequeueChapter` stamped a dummy row (empty
+        // chapterID and name, always content-less — it only ran when the
+        // slot had no content) over every dequeued slot, so real v10 DBs
+        // hold several rows per series with chapterID ''. They carry no
+        // data: drop them, or the unique index below fails on the duplicate
+        // '' keys and bricks the upgrade. A '' row that somehow *has*
+        // content keeps it under a synthetic unique id instead of being
+        // lost. (`number` is part of the primary key, so 'legacy-<number>'
+        // is unique within a series.)
+        await customStatement(
+            "DELETE FROM chapters WHERE chapter_i_d = '' AND content IS NULL");
+        await customStatement("UPDATE chapters SET chapter_i_d = 'legacy-' || number "
+            "WHERE chapter_i_d = '' AND content IS NOT NULL");
+
         // Repair v10 duplicate rows before the unique index can exist.
         await deduplicateChapters();
 
@@ -882,12 +917,16 @@ class AppDB extends _$AppDB {
         await customStatement("UPDATE chapters SET position = number");
 
         // Derive the book's own chapter number from the stored title.
+        // `replace` (per-row upsert), not `replaceAll`: rows with an
+        // unparseable title are absent from the list and must survive.
         var renamed = (await select(chapters).get())
             .map((c) => c.copyWith(chapterNumber: Value(parseChapterNumber(c.name))))
             .where((c) => c.chapterNumber != null)
             .toList();
         await batch((b) {
-          b.replaceAll(chapters, renamed);
+          for (var c in renamed) {
+            b.replace(chapters, c);
+          }
         });
 
         // Promote lastRead to the stable chapterID when the slot is unique.

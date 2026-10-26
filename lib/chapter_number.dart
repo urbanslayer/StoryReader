@@ -101,22 +101,45 @@ int? parseChapterNumber(String title) {
   return value;
 }
 
-/// Greedy word-number grammar for 0..999:
-/// `[<one> hundred] [and] (<tens> [<one>] | <one>)`.
+/// Greedy word-number grammar for 0..9999:
+/// `[<one> thousand] [[and] [<one> hundred]] [and] (<tens> [<one>] | <one>)`.
+/// Thousand multipliers are limited to 1..9 (or "a"/"an"), so "Ten Thousand"
+/// stays unparseable and the value can never leave 0..9999.
 /// Returns `(value, tokensConsumed)` or null when no number starts the list.
 (int, int)? _parseWordNumber(List<String> tokens) {
   int i = 0;
   int total = 0;
   bool any = false;
 
-  bool isHundredsWord(String t) =>
-      t == 'a' || t == 'an' || (_ones.containsKey(t) && _ones[t]! > 0);
+  // Words that may multiply a scale word: "a"/"an" (=1) or a unit number
+  // up to [max] ("seven hundred" -> max 19 keeps "fifteen hundred" = 1500).
+  bool isMultiplier(String t, int max) =>
+      t == 'a' || t == 'an' || (_ones.containsKey(t) && _ones[t]! > 0 && _ones[t]! <= max);
+  int multiplierValue(String t) => t == 'a' || t == 'an' ? 1 : _ones[t]!;
+
+  // "<one> thousand" (or bare "thousand"): "Two Thousand",
+  // "One Thousand and Twelve".
+  if (i + 1 < tokens.length &&
+      isMultiplier(tokens[i], 9) &&
+      tokens[i + 1] == 'thousand') {
+    total += multiplierValue(tokens[i]) * 1000;
+    i += 2;
+    any = true;
+  } else if (i < tokens.length && tokens[i] == 'thousand') {
+    total += 1000;
+    i += 1;
+    any = true;
+  }
+
+  if (any && i < tokens.length && tokens[i] == 'and') {
+    i += 1; // "One Thousand and Twelve"
+  }
 
   // "<one> hundred" (or bare "hundred").
   if (i + 1 < tokens.length &&
-      isHundredsWord(tokens[i]) &&
+      isMultiplier(tokens[i], 19) &&
       tokens[i + 1] == 'hundred') {
-    total += tokens[i] == 'a' || tokens[i] == 'an' ? 100 : _ones[tokens[i]]! * 100;
+    total += multiplierValue(tokens[i]) * 100;
     i += 2;
     any = true;
   } else if (i < tokens.length && tokens[i] == 'hundred') {
@@ -144,7 +167,7 @@ int? parseChapterNumber(String title) {
     any = true;
   }
 
-  if (!any) {
+  if (!any || total > 9999) {
     return null;
   }
   return (total, i);

@@ -45,6 +45,44 @@ void main() {
     });
   });
 
+  group('thousands (0..9999)', () {
+    test('real ScribbleHub titles from On Astral Tides', () {
+      expect(parseChapterNumber("Seven Hundred And Twenty-Three"), 723);
+      // The en dash keeps it a chapter number; the digits later in the
+      // title must not win over the leading word number.
+      expect(parseChapterNumber(
+          "Seven Hundred And Twenty-One – Contains Status- Ginneka 2, Eri 11?"),
+          721);
+      expect(parseChapterNumber("Five Hundred and Seventy-Eight"), 578);
+    });
+
+    test('word thousands', () {
+      expect(parseChapterNumber("One Thousand Two Hundred and Five"), 1205);
+      expect(parseChapterNumber("One Thousand and Twelve"), 1012);
+      expect(parseChapterNumber("Two Thousand"), 2000);
+      expect(parseChapterNumber("A Thousand and One"), 1001);
+      expect(parseChapterNumber("Nine Thousand Nine Hundred and Ninety-Nine"),
+          9999);
+    });
+
+    test('keyword + word thousands', () {
+      expect(parseChapterNumber("Chapter One Thousand and Twelve"), 1012);
+      expect(parseChapterNumber("Chapter Two Thousand: Dawn"), 2000);
+    });
+
+    test('digits beyond 999', () {
+      expect(parseChapterNumber("Chapter 1205: Foo"), 1205);
+      expect(parseChapterNumber("1205 - Title"), 1205);
+    });
+
+    test('still conservative beyond 999', () {
+      // "ten thousand" is 10000, outside 0..9999.
+      expect(parseChapterNumber("Ten Thousand"), isNull);
+      expect(parseChapterNumber("Three Hundred Thousand"), isNull);
+      expect(parseChapterNumber("One Thousand Men"), isNull);
+    });
+  });
+
   group('must not parse', () {
     test('number buried in prose', () {
       expect(parseChapterNumber("He Ran 578 Miles"), isNull);

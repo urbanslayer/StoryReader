@@ -169,6 +169,58 @@ void main() {
       expect((await _all(db)).single.upstreamState, ChapterUpstreamState.upstream);
     });
 
+    test('(f) an empty TOC never wipes stored state', () async {
+      // A Cloudflare-blocked or otherwise failed TOC fetch hands reconcile an
+      // empty list. That must not mark everything missingUpstream and clear
+      // the download queue.
+      await _seed(db, 'c1', 'Chapter One', 0, content: _content1, scroll: 4, queued: true);
+      await _seed(db, 'c2', 'Chapter Two', 1, queued: true);
+
+      await db.reconcileChapters(_site, _series, const []);
+
+      var rows = await _all(db);
+      expect(rows.length, 2);
+      var c1 = rows.firstWhere((c) => c.chapterID == 'c1');
+      expect(c1.upstreamState, ChapterUpstreamState.upstream);
+      expect(c1.queued, isTrue);
+      expect(c1.position, 0);
+      expect(c1.content, _content1);
+      var c2 = rows.firstWhere((c) => c.chapterID == 'c2');
+      expect(c2.upstreamState, ChapterUpstreamState.upstream);
+      expect(c2.queued, isTrue);
+      expect(c2.position, 1);
+    });
+
+    test('(g) content-less placeholders adopt renamed titles', () async {
+      // Placeholder inserted by an earlier reconcile, never downloaded.
+      await _seed(db, 'c1', 'Chapter One', 0);
+      // Queued row, not downloaded yet.
+      await _seed(db, 'c2', 'Chapter Two', 1, queued: true);
+      // Downloaded row: its name must stay paired with its content.
+      await _seed(db, 'c3', 'Chapter Three', 2, content: _content3);
+
+      await db.reconcileChapters(_site, _series, [
+        ChapterData('c1', 'Chapter One (Rewritten)'),
+        ChapterData('c2', 'Chapter Two (Rewritten)'),
+        ChapterData('c3', 'Chapter Three (Renamed)'),
+      ]);
+
+      var rows = await _all(db);
+      var c1 = rows.firstWhere((c) => c.chapterID == 'c1');
+      expect(c1.name, 'Chapter One (Rewritten)');
+      expect(c1.upstreamState, ChapterUpstreamState.upstream);
+      expect(c1.content, isNull);
+
+      var c2 = rows.firstWhere((c) => c.chapterID == 'c2');
+      expect(c2.name, 'Chapter Two (Rewritten)');
+      expect(c2.upstreamState, ChapterUpstreamState.upstream);
+      expect(c2.queued, isTrue); // renaming must not clear the queue
+
+      var c3 = rows.firstWhere((c) => c.chapterID == 'c3');
+      expect(c3.name, 'Chapter Three'); // downloaded: local name kept
+      expect(c3.upstreamState, ChapterUpstreamState.renamed);
+    });
+
     test('lastReadChapterID survives a deletion unchanged', () async {
       await _seed(db, 'c1', 'Chapter One', 0, content: _content1);
       await _seed(db, 'c2', 'Chapter Two', 1, content: _content2);
@@ -249,6 +301,9 @@ void main() {
 
       // Corrupted v10 state: chapterID 'x' occupies two number slots, one of
       // them content-bearing; series.last_read points at the unique 'z' slot.
+      // Upstream v10's `dequeueChapter` also stamped dummy rows with an EMPTY
+      // chapterID over every content-less slot it dequeued, so real v10 DBs
+      // hold several '' rows — they must not break the unique index.
       await legacyRun('INSERT INTO series (site, id, name, description, last_read) '
           "VALUES (0, 'series', 'S', 'D', 2)");
       await legacyRun('INSERT INTO chapters (site, id, number, chapter_i_d, name, content, scroll_position, queued) '
@@ -257,14 +312,34 @@ void main() {
           "VALUES (0, 'series', 5, 'x', 'Chapter Five', X'2A2A', 9, 0)");
       await legacyRun('INSERT INTO chapters (site, id, number, chapter_i_d, name, content, scroll_position, queued) '
           "VALUES (0, 'series', 2, 'z', 'Chapter Two', X'0102', 5, 0)");
+      await legacyRun('INSERT INTO chapters (site, id, number, chapter_i_d, name, content, scroll_position, queued) '
+          "VALUES (0, 'series', 0, '', '', NULL, NULL, 0)");
+      await legacyRun('INSERT INTO chapters (site, id, number, chapter_i_d, name, content, scroll_position, queued) '
+          "VALUES (0, 'series', 1, '', '', NULL, NULL, 1)");
+      // A '' chapterID that somehow carries content: kept under a synthetic
+      // unique id rather than dropped.
+      await legacyRun('INSERT INTO chapters (site, id, number, chapter_i_d, name, content, scroll_position, queued) '
+          "VALUES (0, 'series', 3, '', 'Chapter Four', X'0303', 6, 0)");
+      // Content-less row whose title carries no number: the chapterNumber
+      // backfill must not drop rows it cannot parse.
+      await legacyRun('INSERT INTO chapters (site, id, number, chapter_i_d, name, content, scroll_position, queued) '
+          "VALUES (0, 'series', 6, 'p', 'Prologue', NULL, NULL, 0)");
       await legacy.close();
 
       // Opening the v11 AppDB on that file runs the 10 -> 11 migration.
       db = AppDB(NativeDatabase(file));
       var rows = await _all(db);
 
-      // Deduped: one row per chapterID, content-bearing slot kept.
-      expect(rows.map((c) => c.chapterID), ['x', 'z']);
+      // Deduped: one row per chapterID, content-bearing slot kept. The two
+      // content-less '' dummies are gone; the '' row with content survived
+      // under a synthetic id; the unparseable 'Prologue' row survived the
+      // chapterNumber backfill.
+      expect(rows.map((c) => c.chapterID), ['legacy-3', 'p', 'x', 'z']);
+      expect(rows.firstWhere((c) => c.chapterID == 'p').chapterNumber, isNull);
+      var legacyRow = rows.firstWhere((c) => c.chapterID == 'legacy-3');
+      expect(legacyRow.number, 3);
+      expect(legacyRow.content, Uint8List.fromList([3, 3]));
+      expect(legacyRow.scrollPosition, 6);
       var x = rows.firstWhere((c) => c.chapterID == 'x');
       expect(x.number, 5);
       expect(x.content, _contentX);
