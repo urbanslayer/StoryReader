@@ -314,6 +314,53 @@ class AppDB extends _$AppDB {
       });
     });
   }
+
+  // ---- Legacy (upstream v10) library import ------------------------------
+  // See repairLegacyChapters / promoteLastReadMarkers at the bottom of this
+  // file for the shared repair logic. Nothing here changes the schema.
+
+  /// Imports a full library payload exported by the **original upstream
+  /// StoryReader** (DB schema v10) through the network share: the JSON shape
+  /// is `{series, chapters, chapterImages}` of drift `toJson()` rows, but
+  /// without the v11 columns (`position`, `chapterNumber`, `upstreamState`,
+  /// `isRead`, `lastReadChapterID`).
+  ///
+  /// The rows are converted to the current schema and repaired with **the
+  /// same rules as the v10→v11 migration** ([repairLegacyChapters] +
+  /// [promoteLastReadMarkers]), then the whole DB is replaced inside one
+  /// transaction, exactly like [replaceDB]. Returns per-repair counts.
+  Future<LegacyImportReport> importLegacyV10Library(Map<String, dynamic> payload) async {
+    var seriesRows = (payload["series"] as List? ?? const [])
+        .cast<Map<String, dynamic>>()
+        .map(_seriesFromV10Json)
+        .toList();
+    var chapterRows = (payload["chapters"] as List? ?? const [])
+        .cast<Map<String, dynamic>>()
+        .map(_chapterFromV10Json)
+        .toList();
+    var imageRows = (payload["chapterImages"] as List? ?? const [])
+        .cast<Map<String, dynamic>>()
+        .map(_chapterImageFromV10Json)
+        .toList();
+
+    var repair = repairLegacyChapters(chapterRows);
+    var promoted = promoteLastReadMarkers(seriesRows, repair.kept);
+    seriesRows = [
+      for (var s in seriesRows) s.copyWith(lastReadChapterID: Value(promoted[(s.site, s.id)])),
+    ];
+
+    await replaceDB(seriesRows, repair.kept, imageRows);
+    return LegacyImportReport(
+      series: seriesRows.length,
+      chapters: repair.kept.length,
+      chaptersWithContent: repair.kept.where((c) => c.content != null).length,
+      droppedBlankRows: repair.droppedBlank,
+      dedupedRows: repair.deduped,
+      lastReadMarkersPromoted: promoted.length,
+    );
+  }
+  // ---- end legacy import --------------------------------------------------
+
   
   
   Stream<ChapterStatus> chapterStatus(Site site, String id, int number) {
@@ -1104,52 +1151,23 @@ class AppDB extends _$AppDB {
         await m.addColumn(chapters, chapters.isRead);
         await m.addColumn(seriesTable, seriesTable.lastReadChapterID);
 
-        // Upstream v10's `dequeueChapter` stamped a dummy row (empty
-        // chapterID and name, always content-less — it only ran when the
-        // slot had no content) over every dequeued slot, so real v10 DBs
-        // hold several rows per series with chapterID ''. They carry no
-        // data: drop them, or the unique index below fails on the duplicate
-        // '' keys and bricks the upgrade. A '' row that somehow *has*
-        // content keeps it under a synthetic unique id instead of being
-        // lost. (`number` is part of the primary key, so 'legacy-<number>'
-        // is unique within a series.)
-        await customStatement(
-            "DELETE FROM chapters WHERE chapter_i_d = '' AND content IS NULL");
-        await customStatement("UPDATE chapters SET chapter_i_d = 'legacy-' || number "
-            "WHERE chapter_i_d = '' AND content IS NOT NULL");
-
-        // Repair v10 duplicate rows before the unique index can exist.
-        await deduplicateChapters();
-
-        // Best guess until the first reconcile: the legacy TOC index was the
-        // position when the row was written.
-        await customStatement("UPDATE chapters SET position = number");
-
-        // Derive the book's own chapter number from the stored title.
-        // `replace` (per-row upsert), not `replaceAll`: rows with an
-        // unparseable title are absent from the list and must survive.
-        var renamed = (await select(chapters).get())
-            .map((c) => c.copyWith(chapterNumber: Value(parseChapterNumber(c.name))))
-            .where((c) => c.chapterNumber != null)
-            .toList();
+        // Everything the v10 row shape needs (see the long comment in
+        // [repairLegacyChapters]) is exactly what importing an upstream v10
+        // payload needs too, so the repair lives in that one pure function
+        // and the migration just applies it to the live table.
+        var repair = repairLegacyChapters(await select(chapters).get());
+        await delete(chapters).go();
         await batch((b) {
-          for (var c in renamed) {
-            b.replace(chapters, c);
-          }
+          b.insertAll(chapters, repair.kept);
         });
 
         // Promote lastRead to the stable chapterID when the slot is unique.
+        var promoted = promoteLastReadMarkers(await select(seriesTable).get(), repair.kept);
         for (var s in await select(seriesTable).get()) {
-          var last = s.lastRead;
-          if (last == null) {
-            continue;
-          }
-          var rows = await (select(chapters)
-                ..where((c) => c.site.equals(s.site.index) & c.id.equals(s.id) & c.number.equals(last)))
-              .get();
-          if (rows.length == 1 && rows.single.chapterID.isNotEmpty) {
+          var chapterID = promoted[(s.site, s.id)];
+          if (chapterID != null) {
             await (update(seriesTable)..whereSamePrimaryKey(s))
-                .write(SeriesTableCompanion(lastReadChapterID: Value(rows.single.chapterID)));
+                .write(SeriesTableCompanion(lastReadChapterID: Value(chapterID)));
           }
         }
 
@@ -1163,3 +1181,210 @@ class AppDB extends _$AppDB {
 /// drift-generated snake_case names (`chapterID` -> `chapter_i_d`).
 const String _uniqueChapterIndexStatement =
     "CREATE UNIQUE INDEX IF NOT EXISTS chapters_chapter_key ON chapters (site, id, chapter_i_d)";
+
+// ===========================================================================
+// Legacy (upstream v10) library import — shared repair logic.
+//
+// The v10→v11 migration and AppDB.importLegacyV10Library both need the exact
+// same set of repairs on v10-shaped chapter rows; they live here as pure
+/// functions so the two paths can never diverge. Nothing in this section
+// changes the schema or the migration order.
+// ===========================================================================
+
+/// Result of [repairLegacyChapters]: the surviving rows plus per-repair counts.
+class LegacyChapterRepair {
+  /// Repaired rows, one per `(site, id, chapterID)`.
+  final List<Chapter> kept;
+
+  /// Content-less `''`-chapterID dummy rows that were dropped.
+  final int droppedBlank;
+
+  /// Duplicate-`chapterID` rows that were dropped by the dedupe.
+  final int deduped;
+
+  const LegacyChapterRepair({required this.kept, required this.droppedBlank, required this.deduped});
+}
+
+/// Repairs a list of v10-shaped chapter rows into current-schema rows,
+/// applying the exact rules the v10→v11 migration uses:
+///
+/// * Upstream v10's `dequeueChapter` stamped a dummy row (empty `chapterID`
+///   and name, always content-less — it only ran when the slot had no
+///   content) over every dequeued slot, so real v10 data holds several rows
+///   per series with `chapterID == ''`. They carry no data: drop them, or
+///   the unique `(site, id, chapterID)` index fails on the duplicate `''`
+///   keys. A `''` row that somehow *has* content keeps it under a synthetic
+///   unique id (`legacy-<number>` — unique within a series, since `number`
+///   is part of the primary key) instead of being lost.
+/// * Dedupe by `(site, id, chapterID)` (the v10 corruption where one
+///   `chapterID` occupied several `number` slots — see `EXPANSION.md` M1):
+///   keep the row with content (highest `number` among content-bearing
+///   rows, so name+content+scrollPosition stay together), else the highest
+///   `number`. Same rule as [AppDB.deduplicateChapters].
+/// * `position = number` (best guess until the first reconcile: the legacy
+///   TOC index was the position when the row was written).
+/// * `chapterNumber = parseChapterNumber(name)`, null for unparseable
+///   titles.
+///
+/// Pure form of the repair shared with the v10→v11 migration. Input rows may
+/// carry whatever the current-schema defaults are for the v11 columns — the
+/// function sets `position`, `chapterNumber` and the identity fixes itself.
+LegacyChapterRepair repairLegacyChapters(List<Chapter> input) {
+  var droppedBlank = 0;
+  var identified = <Chapter>[];
+  for (var c in input) {
+    if (c.chapterID.isEmpty) {
+      if (c.content == null) {
+        droppedBlank++;
+        continue;
+      }
+      identified.add(c.copyWith(chapterID: "legacy-${c.number}"));
+    } else {
+      identified.add(c);
+    }
+  }
+
+  var kept = <Chapter>[];
+  var deduped = 0;
+  for (var group in groupBy(identified, (Chapter c) => (c.site, c.id, c.chapterID)).entries) {
+    var rows = group.value.toList()
+      ..sort((a, b) {
+        var ca = a.content != null ? 1 : 0;
+        var cb = b.content != null ? 1 : 0;
+        if (ca != cb) {
+          return cb.compareTo(ca); // content-bearing rows win
+        }
+        return b.number.compareTo(a.number); // newest write wins
+      });
+    kept.add(rows.first);
+    deduped += rows.length - 1;
+  }
+
+  return LegacyChapterRepair(
+    droppedBlank: droppedBlank,
+    deduped: deduped,
+    kept: [
+      for (var c in kept)
+        c.copyWith(position: c.number, chapterNumber: Value(parseChapterNumber(c.name))),
+    ],
+  );
+}
+
+/// For each series whose legacy numeric `lastRead` marker resolves to
+/// exactly one repaired row with a non-empty `chapterID`, the `chapterID`
+/// that marker should be promoted to. Shared by the v11 migration and the
+/// v10 library import; keyed by `(site, series id)`.
+Map<(Site, String), String> promoteLastReadMarkers(List<Series> series, List<Chapter> repaired) {
+  var out = <(Site, String), String>{};
+  for (var s in series) {
+    var last = s.lastRead;
+    if (last == null) {
+      continue;
+    }
+    var rows = repaired.where((c) => c.site == s.site && c.id == s.id && c.number == last).toList();
+    if (rows.length == 1 && rows.single.chapterID.isNotEmpty) {
+      out[(s.site, s.id)] = rows.single.chapterID;
+    }
+  }
+  return out;
+}
+
+/// Per-repair counts returned by [AppDB.importLegacyV10Library].
+class LegacyImportReport {
+  final int series;
+  final int chapters;
+  final int chaptersWithContent;
+  final int droppedBlankRows;
+  final int dedupedRows;
+  final int lastReadMarkersPromoted;
+
+  const LegacyImportReport({
+    required this.series,
+    required this.chapters,
+    required this.chaptersWithContent,
+    required this.droppedBlankRows,
+    required this.dedupedRows,
+    required this.lastReadMarkersPromoted,
+  });
+
+  @override
+  String toString() =>
+      "$series series, $chapters chapters ($chaptersWithContent with content), "
+      "$droppedBlankRows blank rows dropped, $dedupedRows duplicates removed, "
+      "$lastReadMarkersPromoted last-read markers promoted";
+}
+
+// v10 JSON value helpers. Drift's default ValueSerializer encodes blobs as
+// plain JSON int arrays and DateTimes as epoch millis (older/newer drift
+// variants use base64 strings / ISO-8601 — accept both shapes).
+
+Uint8List? _legacyBlob(dynamic v) {
+  if (v == null) {
+    return null;
+  }
+  if (v is Uint8List) {
+    return v;
+  }
+  if (v is List) {
+    return Uint8List.fromList(v.cast<int>());
+  }
+  if (v is String) {
+    return base64Decode(v);
+  }
+  throw FormatException("Unsupported blob encoding: ${v.runtimeType}");
+}
+
+DateTime? _legacyDateTime(dynamic v) {
+  if (v == null) {
+    return null;
+  }
+  if (v is int) {
+    return DateTime.fromMillisecondsSinceEpoch(v);
+  }
+  return DateTime.parse(v.toString());
+}
+
+bool _legacyBool(dynamic v, bool fallback) {
+  if (v == null) {
+    return fallback;
+  }
+  if (v is bool) {
+    return v;
+  }
+  return (v as int) != 0;
+}
+
+Series _seriesFromV10Json(Map<String, dynamic> j) => Series(
+      site: Site.values[j["site"] as int],
+      id: j["id"] as String,
+      name: j["name"] as String,
+      description: j["description"] as String,
+      thumbnail: _legacyBlob(j["thumbnail"]),
+      lastRead: j["lastRead"] as int?,
+      lastReadDate: _legacyDateTime(j["lastReadDate"]),
+      thumbnailWidth: j["thumbnailWidth"] as int?,
+      thumbnailHeight: j["thumbnailHeight"] as int?,
+    );
+
+Chapter _chapterFromV10Json(Map<String, dynamic> j) => Chapter(
+      site: Site.values[j["site"] as int],
+      id: j["id"] as String,
+      number: j["number"] as int,
+      chapterID: j["chapterID"] as String,
+      name: j["name"] as String,
+      content: _legacyBlob(j["content"]),
+      scrollPosition: j["scrollPosition"] as int?,
+      queued: _legacyBool(j["queued"], false),
+      // v11 columns, fixed up by repairLegacyChapters / defaults:
+      position: j["number"] as int,
+      chapterNumber: parseChapterNumber(j["name"] as String),
+      upstreamState: ChapterUpstreamState.upstream,
+      isRead: false,
+    );
+
+ChapterImage _chapterImageFromV10Json(Map<String, dynamic> j) => ChapterImage(
+      id: j["id"] as int,
+      url: j["url"] as String,
+      image: _legacyBlob(j["image"]),
+      shouldDownload: _legacyBool(j["shouldDownload"], true),
+    );

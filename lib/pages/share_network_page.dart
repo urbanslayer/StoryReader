@@ -39,7 +39,11 @@ class _ShareNetworkPageState extends State<ShareNetworkPage> {
         }
         if (clientDBVersion == null || int.tryParse(clientDBVersion) != appDB.schemaVersion) {
           router.pop();
-          return Response(406, body: "Schema mismatch");
+          return Response(406, body: "Schema mismatch: this app exports schema version "
+              "${appDB.schemaVersion}, the client announced "
+              "${clientDBVersion == null ? "no version" : "\"$clientDBVersion\""}. To receive a "
+              "v10 export from the original StoryReader, pick \"Original StoryReader\" as the "
+              "source app on the receiving side.");
         }
         var resp = <String, dynamic>{
           "series": (await appDB.select(appDB.seriesTable).get()).map((s) => s.toJson()).toList(),
