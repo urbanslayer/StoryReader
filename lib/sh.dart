@@ -6,10 +6,12 @@ import 'package:chopper/chopper.dart';
 import 'package:html/parser.dart';
 import 'package:html/dom.dart';
 import 'package:http/http.dart' as http;
+import 'package:story_reader/client.dart';
 import 'package:story_reader/db.dart';
 import 'package:story_reader/prefs.dart';
 import 'package:story_reader/rich_text_tree.dart';
 import 'package:story_reader/series_data.dart';
+import 'package:story_reader/sh_toc.dart';
 import 'package:async/async.dart';
 
 part 'sh.chopper.dart';
@@ -41,18 +43,102 @@ abstract class SHAPI extends ChopperService {
   @FormUrlEncoded()
   Future<Response> _base(@Body() Map<String, dynamic> fields);
 
-  Future<Response<List<ChapterData>>> chapters(String id) async {
-    var resp = await _base({"action": "wi_gettocchp", "strSID": id});
-    if (!resp.isSuccessful) {
-      return resp.copyWith();
+  /// One `?toc=N` page of the series page's table of contents. ScribbleHub
+  /// ignores the slug for routing, so a fixed placeholder slug is fine when
+  /// only the numeric series id is known. Measured live: Cloudflare answers
+  /// `?toc=N` with 403 unless the request carries the series page as
+  /// `Referer`, hence the required header parameter.
+  @Get(path: "series/{id}/{slugged}/")
+  Future<Response> _seriesToc(@Path("id") String id, @Path("slugged") String slugged,
+      @Query("toc") int toc, @Header("Referer") String referer);
+
+  /// Fetches the table of contents for a series.
+  ///
+  /// Tries the `wi_gettocchp` admin-ajax endpoint first; if it errors, is
+  /// blocked by Cloudflare, or yields fewer than two chapters, falls back to
+  /// scraping the series page (`?toc=1..n`, sequential requests with
+  /// [tocPageDelay] between pages).
+  ///
+  /// Both endpoints list chapters newest-first, so the returned
+  /// [Response.body] keeps the historical contract of this method and is
+  /// **descending (newest-first)** — `series_net_page.dart` reverses it for
+  /// display. Throws [SiteBlocked] when the site answered with a Cloudflare
+  /// interstitial (and nothing could be salvaged from the pagination
+  /// fallback), instead of a bare [HttpException].
+  Future<Response<List<ChapterData>>> chapters(String id,
+      {Duration tocPageDelay = const Duration(milliseconds: 750)}) async {
+    Response? ajaxResp;
+    SiteBlocked? blocked;
+    try {
+      var resp = await _base({"action": "wi_gettocchp", "strSID": id});
+      if (isCloudflareInterstitial(resp.statusCode, resp.bodyString)) {
+        blocked = SiteBlocked("https://www.scribblehub.com/wp-admin/admin-ajax.php",
+            statusCode: resp.statusCode);
+      } else if (resp.isSuccessful) {
+        var parsed = parseScribbleHubToc(resp.bodyString);
+        if (parsed.length > 1) {
+          // Historical contract: newest-first (document) order.
+          return resp.copyWith(body: parsed.reversed.toList());
+        }
+        ajaxResp = resp;
+      }
+    } catch (e) {
+      // Network error / timeout: fall through to the series page fallback.
     }
-    var body = parseFragment(resp.bodyString);
-    return resp.copyWith(
-        body: body.children[0].children[0].children.map((e) {
-      var segments = Uri.parse(e.children[0].attributes["href"]!).pathSegments;
-      var id = segments[segments.length - 2];
-      return ChapterData(id, e.text.trim());
-    }).toList());
+
+    // Fallback: series pages. The plain series page (no query) *is* the first
+    // TOC page; pages 2..n need `?toc=N` with the series page as Referer (see
+    // _seriesToc). Page 1 holds the newest chapters; later pages hold older
+    // ones. Stop once a page adds nothing new.
+    const maxTocPages = 200; // ~3000 chapters at ~15 per page; safety bound.
+    const tocSlug = "chapters"; // slug is ignored for routing
+    final pageUrl = "https://www.scribblehub.com/series/$id/$tocSlug/";
+    final pageBodies = <String>[];
+    final seen = <String>{};
+    Response? lastResp;
+    var complete = false;
+    for (var toc = 1; toc <= maxTocPages; toc++) {
+      if (toc > 1) {
+        await Future.delayed(tocPageDelay);
+      }
+      Response resp;
+      try {
+        resp = toc == 1 ? await _series(id, tocSlug) : await _seriesToc(id, tocSlug, toc, pageUrl);
+      } catch (e) {
+        break; // network failure: don't retry endlessly here, RetryInterceptor already did
+      }
+      if (isCloudflareInterstitial(resp.statusCode, resp.bodyString)) {
+        blocked = SiteBlocked("$pageUrl?toc=$toc", statusCode: resp.statusCode);
+        break;
+      }
+      if (!resp.isSuccessful) {
+        break;
+      }
+      final pageAsc = parseScribbleHubToc(resp.bodyString);
+      final fresh = pageAsc.where((c) => seen.add(c.id)).toList();
+      if (fresh.isEmpty) {
+        complete = true; // pagination exhausted — count stopped growing
+        break;
+      }
+      pageBodies.add(resp.bodyString);
+      lastResp = resp;
+    }
+
+    if (lastResp != null && (complete || pageBodies.length >= maxTocPages)) {
+      final ascending = parseScribbleHubTocPages(pageBodies);
+      // Historical contract: newest-first.
+      return lastResp.copyWith(body: ascending.reversed.toList());
+    }
+    // Nothing usable: surface the block distinctly if we saw one.
+    if (blocked != null) {
+      throw blocked;
+    }
+    if (ajaxResp != null) {
+      // The ajax call worked but produced <= 1 chapter; hand back whatever it
+      // parsed so single-chapter series still render.
+      return ajaxResp.copyWith(body: parseScribbleHubToc(ajaxResp.bodyString));
+    }
+    throw const HttpException("Could not fetch ScribbleHub table of contents");
   }
 
   @Get(path: "read/{idSlug}/chapter/{id}/")
@@ -118,7 +204,7 @@ abstract class SHAPI extends ChopperService {
   static SHAPI create() => _$SHAPI(_shC);
 }
 
-final _shC = ChopperClient(interceptors: [RetryInterceptor()]);
+final _shC = ChopperClient(client: httpClient(), interceptors: [RetryInterceptor()]);
 
 int postfixedParseInt(String s) {
   s = s.trim();
@@ -143,8 +229,9 @@ final class RetryInterceptor implements Interceptor {
   FutureOr<Response<BodyType>> intercept<BodyType>(Chain<BodyType> chain) async {
     Response<BodyType>? res;
     var headers = Map.fromEntries(chain.request.headers.entries);
-    // TODO use user agent if a site requires it
-    //headers["User-Agent"] = "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0";
+    // NOTE: do not inject a browser User-Agent here — see lib/client.dart for
+    // the measured live behavior (spoofed browser UAs from dart:io trigger
+    // Cloudflare 403 interstitials on both sites; the default UA passes).
     var req = chain.request.copyWith(headers: headers);
     for (int i = 0; i < 3; i++) {
       try {
