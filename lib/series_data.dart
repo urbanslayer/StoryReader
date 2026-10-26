@@ -67,7 +67,14 @@ final class ChapterData {
   String name;
   RichTextDocument? content;
 
-  ChapterData(this.id, this.name, [this.content]);
+  /// M3b: the raw source HTML this chapter was parsed from (the sanitizer
+  /// input for EPUB export — `#chp_raw` inner HTML on ScribbleHub, the
+  /// processed `.chapter-content` on RoyalRoad). Null when unavailable
+  /// (TOC entries, older parsers); the EPUB export then falls back to the
+  /// lossy [content] tree.
+  String? rawHtml;
+
+  ChapterData(this.id, this.name, [this.content, this.rawHtml]);
 
   @override
   String toString() {

@@ -1,7 +1,10 @@
 import 'package:collection/collection.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:story_reader/db.dart';
+import 'package:story_reader/epub/export_service.dart';
 import 'package:story_reader/main.dart';
+import 'package:story_reader/prefs.dart';
 import 'package:story_reader/series_data.dart';
 
 class SeriesPage extends StatefulWidget {
@@ -50,6 +53,7 @@ class _SeriesPageState extends State<SeriesPage> {
                         if (size.width >= breakpoint) _deleteButton(c),
                         if (chapters.isNotEmpty && size.width >= breakpoint) _continueButton(chapters),
                         if (size.width >= breakpoint) _netButton(),
+                        if (size.width >= breakpoint) _exportButton(),
                       ],
                     ),
                     actions: [
@@ -70,7 +74,11 @@ class _SeriesPageState extends State<SeriesPage> {
                                   const PopupMenuItem(
                                     child: Text("Continue"),
                                     value: 2,
-                                  )
+                                  ),
+                                const PopupMenuItem(
+                                  child: Text("Export EPUB"),
+                                  value: 3,
+                                )
                               ];
                             },
                             onSelected: (v) {
@@ -82,6 +90,9 @@ class _SeriesPageState extends State<SeriesPage> {
                               }
                               if (v == 2 && chapters.isNotEmpty) {
                                 _doContinue(chapters);
+                              }
+                              if (v == 3) {
+                                _showExportDialog();
                               }
                             },
                           )
@@ -168,6 +179,157 @@ class _SeriesPageState extends State<SeriesPage> {
             child: (inProgress == null)
                 ? const Text("Online Version", softWrap: true)
                 : const CircularProgressIndicator()));
+  }
+
+  Flexible _exportButton() {
+    return Flexible(
+        flex: 1,
+        child: ElevatedButton(
+            onPressed: _showExportDialog, child: const Text("Export EPUB", softWrap: true)));
+  }
+
+  /// Export dialog: chapter count (remembered in [Preferences]), whether to
+  /// download missing chapters, whether to mark exported ones as read, and
+  /// how many unread chapters there are.
+  Future<void> _showExportDialog() async {
+    var unreadCount = 0;
+    try {
+      unreadCount =
+          (await appDB.nextUnreadChaptersForExport(widget.series.site, widget.series.id, 1000000)).length;
+    } catch (_) {
+      // The dialog still works with a zero count; the export reports errors.
+    }
+    if (!mounted) {
+      return;
+    }
+    var count = Preferences.exportChapterCount.value.clamp(1, 10000);
+    var fetchMissing = true;
+    var markRead = true;
+    var countError = false;
+    final controller = TextEditingController(text: count.toString());
+    final chosen = await showDialog<bool>(
+        context: context,
+        builder: (c) => StatefulBuilder(builder: (c, setDialogState) {
+              return AlertDialog(
+                title: const Text("Export EPUB"),
+                content: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(unreadCount == 1
+                          ? "1 unread chapter available."
+                          : "$unreadCount unread chapters available."),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: controller,
+                        keyboardType: TextInputType.number,
+                        decoration: InputDecoration(
+                          labelText: "Number of chapters",
+                          errorText: countError ? "Enter a number from 1 to 10000" : null,
+                        ),
+                      ),
+                      CheckboxListTile(
+                        value: fetchMissing,
+                        onChanged: (v) => setDialogState(() => fetchMissing = v ?? true),
+                        title: const Text("Download missing chapters"),
+                        contentPadding: EdgeInsets.zero,
+                      ),
+                      CheckboxListTile(
+                        value: markRead,
+                        onChanged: (v) => setDialogState(() => markRead = v ?? true),
+                        title: const Text("Mark exported chapters as read"),
+                        contentPadding: EdgeInsets.zero,
+                      ),
+                    ],
+                  ),
+                ),
+                actions: [
+                  TextButton(onPressed: () => Navigator.of(c).pop(false), child: const Text("Cancel")),
+                  TextButton(
+                      onPressed: () {
+                        final parsed = int.tryParse(controller.text.trim());
+                        if (parsed == null || parsed < 1 || parsed > 10000) {
+                          setDialogState(() => countError = true);
+                          return;
+                        }
+                        count = parsed;
+                        Navigator.of(c).pop(true);
+                      },
+                      child: const Text("Export")),
+                ],
+              );
+            }));
+    controller.dispose();
+    if (chosen != true) {
+      return;
+    }
+    Preferences.exportChapterCount.value = count;
+    await _runExport(count: count, fetchMissing: fetchMissing, markRead: markRead);
+  }
+
+  /// Runs the export behind a progress dialog, then the SAF save sheet, and
+  /// only marks the chapters as read after the file was actually saved.
+  Future<void> _runExport({required int count, required bool fetchMissing, required bool markRead}) async {
+    final progress = ValueNotifier<ExportProgress>(const ExportProgress(ExportPhase.refreshingToc));
+    // ignore: unawaited_futures
+    showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (c) => ValueListenableBuilder(
+            valueListenable: progress,
+            builder: (c, p, _) => AlertDialog(
+                  content: Row(children: [
+                    const SizedBox(
+                        width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2.5)),
+                    const SizedBox(width: 16),
+                    Expanded(child: Text(p.label)),
+                  ]),
+                )));
+    try {
+      final result = await exportNextUnread(appDB, widget.series.site, widget.series.id,
+          limit: count,
+          fetchMissing: fetchMissing,
+          markAsRead: markRead,
+          onProgress: (p) => progress.value = p);
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context).pop(); // close the progress dialog
+      String? savedPath;
+      try {
+        savedPath = await FilePicker.saveFile(
+            dialogTitle: "Save EPUB", fileName: result.fileName, bytes: result.bytes);
+      } catch (e) {
+        _showExportSnack("Could not save the file: $e");
+        return;
+      }
+      if (savedPath == null) {
+        _showExportSnack("Save cancelled — nothing was marked as read.");
+        return;
+      }
+      await result.markExportedChaptersRead(appDB, widget.series.site, widget.series.id);
+      final skipped = result.skippedUnavailable.length;
+      _showExportSnack("Exported ${result.exportedChapterIDs.length} chapters to ${result.fileName}"
+          "${skipped > 0 ? " ($skipped unavailable)" : ""} — "
+          "${result.imagesEmbedded} images embedded, ${result.imagesMissing} unavailable.");
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context).pop(); // close the progress dialog
+      final message = e is ExportException ? e.message : "$e";
+      _showExportSnack("Export failed: $message");
+    } finally {
+      progress.dispose();
+    }
+  }
+
+  void _showExportSnack(String text) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(text),
+      duration: const Duration(seconds: 6),
+    ));
   }
 
   void _doNet() {

@@ -46,6 +46,7 @@ dependencies:
   html: ^0.15.4
   archive: ^4.0.7
   flutter_inappwebview: ^6.1.5
+  file_picker: ^11.0.3
   
   
   #shelf_proxy: ^1.0.0

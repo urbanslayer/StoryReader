@@ -133,7 +133,8 @@ void _chapterDownloadManager() async {
                 classifyChapterFetch(resp.statusCode, resp.bodyString, data?.content != null);
             switch (outcome) {
               case DownloadOutcome.save:
-                await db.saveChapter(c.site, c.id, c.number, c.chapterID, data!.content!, data.name);
+                await db.saveChapter(c.site, c.id, c.number, c.chapterID, data!.content!, data.name,
+                    rawHtml: data.rawHtml);
               case DownloadOutcome.dequeue:
                 // 404/410 (chapter deleted upstream) or a 200 page for *this*
                 // chapter that can never parse: dequeue it and carry on with

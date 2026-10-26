@@ -34,6 +34,7 @@ final class Preferences {
         _setupNotifier(ignoreVersion, "ignoreVersion", null);
         _setupNotifier(themeSeed, "themeColor", 0);
         _setupNotifier(darkMode, "darkMode", true);
+        _setupNotifier(exportChapterCount, "exportChapterCount", 100);
       }();
     return _loading!;
   }
@@ -45,6 +46,9 @@ final class Preferences {
   static ValueNotifier<String?> ignoreVersion = ValueNotifier(null);
   static ValueNotifier<int> themeSeed = ValueNotifier(0);
   static ValueNotifier<bool> darkMode = ValueNotifier(true);
+
+  /// Default chapter count for the series page's "Export EPUB" dialog.
+  static ValueNotifier<int> exportChapterCount = ValueNotifier(100);
 
   static void _setOrRemove<T>(String key, T? value) {
     if (value == null) {

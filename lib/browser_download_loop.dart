@@ -292,7 +292,7 @@ final class AppDBBrowserStore implements BrowserChapterStore {
   @override
   Future<void> saveChapter(BrowserQueuedChapter chapter, ChapterData data) =>
       db.saveChapter(Site.scribbleHub, chapter.seriesId, chapter.number,
-          chapter.chapterID, data.content!, data.name);
+          chapter.chapterID, data.content!, data.name, rawHtml: data.rawHtml);
 
   @override
   Future<void> dequeueChapter(BrowserQueuedChapter chapter) =>
