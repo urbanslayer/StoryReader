@@ -53,3 +53,4 @@ app.*.map.json
 
 # local agent workflow notes
 CLAUDE.md
+.worktrees/
