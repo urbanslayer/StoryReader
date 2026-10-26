@@ -1,7 +1,7 @@
 name: story_reader
 description: ""
 publish_to: 'none'
-version: 0.9.2+3
+version: 0.9.3+4
 
 environment:
   sdk: '>=3.4.3 <4.0.0'
