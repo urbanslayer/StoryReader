@@ -63,10 +63,19 @@ flutter build apk --release --split-per-abi               # per-ABI APK for a re
 Install on a device: `flutter install --debug`, or sideload the arm64 release APK.
 There are no real tests to run (`test/` is one empty file plus a live-network print script).
 
-## Release signing (not done)
+## Release signing (still the debug key — deliberate for now)
 
-`android/app/build.gradle` signs `release` with **debug keys** (upstream TODO). For a real fork
-build:
+`android/app/build.gradle` signs `release` with **debug keys** (upstream TODO, kept for the fork
+until a real release channel exists). Consequences of signing releases with the debug key at
+`~/.android/debug.keystore`:
+
+- **Sideloaded updates only install when the APK was built on this machine**, because that is the
+  machine whose `~/.android/debug.keystore` signs them. An APK built elsewhere has a different
+  debug key → signature mismatch → uninstall (losing app data) before install.
+- **Back up `~/.android/debug.keystore`** (and keep it out of the repo). It is currently the only
+  thing tying every installable build of this fork together.
+
+For a real fork release later:
 
 ```sh
 keytool -genkey -v -keystore storyreader-keystore.jks -keyalg RSA -keysize 2048 \
@@ -74,15 +83,31 @@ keytool -genkey -v -keystore storyreader-keystore.jks -keyalg RSA -keysize 2048 
 ```
 then a gitignored `key.properties` + `signingConfigs.release` in `android/app/build.gradle`.
 
-## Package id (decide before first install)
+## Package id (done: the fork has its own id)
 
-`applicationId` is `io.github.tareksander.StoryReader` — the same id the upstream F-Droid build
-uses. Installing our APK over/beside an upstream install fails with a signature mismatch. If the
-upstream app is currently installed with the real library, either uninstall it first (losing its
-DB) or change the fork's `applicationId` (e.g. `dev.lain.storyreader`) and move the library across
-with the built-in *share/receive over local network* transfer — that transfer hard-fails on a
-schema-version mismatch (`lib/pages/share_network_page.dart`), so it must run **before** the DB
-migration in `docs/EXPANSION.md` ships, or the receiver must be made version-tolerant.
+The fork installs **beside** the upstream F-Droid app:
+
+| | upstream | fork |
+|---|---|---|
+| `applicationId` | `io.github.tareksander.StoryReader` | `io.github.urbanslayer.storyreader` |
+| launcher label | StoryReader | StoryReader+ |
+| DB schema | 10 | 11+ (`lib/db.dart`) |
+
+The Kotlin `namespace`/package (`com.tsander.story_reader`) and `MainActivity` stay as they are —
+changing them only requires moving files and gains nothing (nothing references the old
+applicationId in Kotlin/XML).
+
+Because both apps coexist, the user's real library moves via the built-in *share/receive over
+local network* transfer: **old app = sender** (Share page), **fork = receiver** (Load page). The
+fork's Load page has a *Source app* picker; "Original StoryReader" sends `X-Schema: 10` and runs
+`AppDB.importLegacyV10Library` (`lib/db.dart`), which converts the v10 payload and applies the
+same repairs as the v10→v11 migration (drop v10's content-less `''` dummy rows, rename
+content-bearing `''` rows to `legacy-<number>`, dedupe duplicate `chapterID`s, backfill
+`position`/`chapterNumber`, promote `lastRead` to `lastReadChapterID`). The sender answers exactly
+**one** request per sharing session (even a rejected one, `used` is set first), so the schema
+version must be chosen correctly **before** pressing Load; if a transfer was rejected, restart the
+Share page on the source app before retrying. Fork→fork transfers keep using the unchanged
+same-schema `replaceDB` path.
 
 ## Repo map (Android-relevant)
 
