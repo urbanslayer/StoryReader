@@ -277,7 +277,29 @@ ChapterData parseScribbleHubChapter(String html, String chapterId) {
   if (content == null) {
     throw StateError("ScribbleHub chapter page has no #chp_raw element");
   }
-  return ChapterData(chapterId, titles.first.text, RichTextDocument.html(content.nodes));
+  return ChapterData(
+      chapterId, titles.first.text, RichTextDocument.html(content.nodes), scribbleHubRawHtml(doc, content));
+}
+
+/// The sanitizer input stored as [ChapterData.rawHtml] for ScribbleHub: the
+/// inner HTML of `#chp_raw`, plus any author-note (`wi_authornotes`) or
+/// announcement (`wi_news`) blocks that live *outside* `#chp_raw` on the page
+/// (the sanitizer already turns both block kinds into asides).
+String scribbleHubRawHtml(Document doc, Element chpRaw) {
+  final sb = StringBuffer(chpRaw.innerHtml);
+  for (final el in doc.querySelectorAll(".wi_authornotes, .wi_news")) {
+    var inside = false;
+    for (var p = el.parent; p != null; p = p.parent) {
+      if (p == chpRaw) {
+        inside = true;
+        break;
+      }
+    }
+    if (!inside) {
+      sb.write(el.outerHtml);
+    }
+  }
+  return sb.toString();
 }
 
 final class RetryInterceptor implements Interceptor {

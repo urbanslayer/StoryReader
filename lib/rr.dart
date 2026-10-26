@@ -168,7 +168,11 @@ abstract class RRAPI extends ChopperService {
       }
     }
     
-    return resp.copyWith(body: ChapterData(id, name, RichTextDocument.html(content.nodes)));
+    // M3b: the *processed* .chapter-content (hidden anti-piracy paragraph
+    // removed, author notes relocated and wrapped as wi_authornotes) is the
+    // sanitizer input kept for EPUB export.
+    final rawHtml = content.innerHtml;
+    return resp.copyWith(body: ChapterData(id, name, RichTextDocument.html(content.nodes), rawHtml));
   }
   
   

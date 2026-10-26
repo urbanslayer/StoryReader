@@ -141,6 +141,13 @@ class Chapters extends Table {
 
   BoolColumn get isRead => boolean().withDefault(const Constant(false))();
 
+  /// M3b: the sanitized source HTML the [content] RichText tree was parsed
+  /// from (gzip, like [content]) — the input of `RichTextDocument.html` at
+  /// download time (`#chp_raw` inner HTML on ScribbleHub, the processed
+  /// `.chapter-content` on RoyalRoad). Null for chapters stored before
+  /// schema v12; EPUB export then falls back to `richTextToXhtml(content)`.
+  BlobColumn get rawHtml => blob().nullable()();
+
   @override
   Set<Column<Object>>? get primaryKey => {site, id, number};
 }
@@ -507,12 +514,16 @@ class AppDB extends _$AppDB {
     );
   }
 
-  Future<void> saveChapter(Site site, String id, int number, String chapterID, RichTextDocument contents, String name) {
+  Future<void> saveChapter(Site site, String id, int number, String chapterID, RichTextDocument contents, String name,
+      {String? rawHtml}) {
     return transaction(() async {
       var imageIDS = await Future.wait(contents.imageSources.map((url) => addImage(url.toString())).toList());
       //print(imageIDS);
       contents.rewriteImageIndices(imageIDS);
       var content = Uint8List.fromList(_gzip.encoder.convert(_utf8.encoder.convert(jsonEncode(contents.toJson()))));
+      var rawHtmlBlob = rawHtml == null
+          ? null
+          : Uint8List.fromList(_gzip.encoder.convert(_utf8.encoder.convert(rawHtml)));
       // The row identified by the stable chapterID is the save target; the
       // legacy (site, id, number) slot is only a fallback for pre-M1 callers.
       var byID = await (select(chapters)
@@ -531,6 +542,9 @@ class AppDB extends _$AppDB {
               chapterID: Value(chapterID),
               name: Value(name),
               content: Value(content),
+              // Keep the pair atomic: a stored rawHtml must belong to the
+              // stored content, so a save without rawHtml clears the column.
+              rawHtml: Value(rawHtmlBlob),
               chapterNumber: Value(parseChapterNumber(name)),
               queued: const Value(false),
             ));
@@ -821,6 +835,42 @@ class AppDB extends _$AppDB {
         .write(ChaptersCompanion(isRead: Value(read)));
   }
 
+  // ---- M3b EPUB export support -------------------------------------------
+  // (Self-contained block added with schema v12; keeps merges with parallel
+  // db.dart work simple.)
+
+  /// The stored source HTML of a chapter (see [Chapters.rawHtml]), or null
+  /// for chapters stored before schema v12.
+  String? chapterRawHtml(Chapter c) {
+    if (c.rawHtml != null) {
+      return _utf8.decoder.convert(_gzip.decoder.convert(c.rawHtml!));
+    }
+    return null;
+  }
+
+  /// Like [nextUnreadChapters] but **including content-less placeholders**:
+  /// chapters that are unread and still published upstream, whether or not
+  /// their content has been downloaded. The EPUB exporter fetches the
+  /// content-less ones on demand (or skips them when fetching is off).
+  /// [nextUnreadChapters] itself keeps its downloaded-only semantics.
+  Future<List<Chapter>> nextUnreadChaptersForExport(Site site, String id, int limit) {
+    return (select(chapters)
+          ..where((c) =>
+              c.site.equals(site.index) &
+              c.id.equals(id) &
+              c.isRead.equals(false) &
+              c.upstreamState.isNotInValues([ChapterUpstreamState.missingUpstream]))
+          ..orderBy(canonicalChapterOrder)
+          ..limit(limit))
+        .get();
+  }
+
+  /// The image row registered for [url], if any. Used by the EPUB exporter
+  /// to map `<img src>` in stored rawHtml onto stored blobs.
+  Future<ChapterImage?> imageByUrl(String url) {
+    return (select(chapterImages)..where((i) => i.url.equals(url))).getSingleOrNull();
+  }
+
   /// Repairs the v10-era corruption where one `chapterID` occupies several
   /// `number` slots: keeps exactly one row per `(site, id, chapterID)` — the
   /// one with content (highest `number` among content-bearing rows, so its
@@ -951,7 +1001,7 @@ class AppDB extends _$AppDB {
   }
 
   @override
-  int get schemaVersion => 11;
+  int get schemaVersion => 12;
 
   @override
   MigrationStrategy get migration {
@@ -959,6 +1009,13 @@ class AppDB extends _$AppDB {
       await m.createAll();
       await customStatement(_uniqueChapterIndexStatement);
     }, onUpgrade: (Migrator m, int from, int to) async {
+      if (from < 12) {
+        // M3b — raw source HTML for lossless EPUB export. Nullable column,
+        // old chapters keep null and export falls back to the RichText tree.
+        // Added *first* because several older migration steps rewrite whole
+        // rows (batch.replaceAll/replace) against the current column set.
+        await m.addColumn(chapters, chapters.rawHtml);
+      }
       await transaction(() async {
         if (from < 2) {
           await m.addColumn(seriesTable, seriesTable.lastReadDate);

@@ -110,6 +110,12 @@ String imageMediaType(Uint8List bytes) {
   return 'application/octet-stream';
 }
 
+/// File extension [buildEpub] gives an image of [mediaType], or null when
+/// that type is not bundled (callers must then treat the image as
+/// unresolvable in `resolveImage`). Export-side callers use this to build
+/// in-book hrefs (`../images/<key>.<ext>`) that match the packaged files.
+String? imageFileExtension(String mediaType) => _mediaExtensions[mediaType];
+
 String _w3cdtf(DateTime d) {
   final u = d.toUtc();
   String two(int n) => n.toString().padLeft(2, '0');
