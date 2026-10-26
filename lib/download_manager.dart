@@ -7,21 +7,42 @@ import 'package:chopper/chopper.dart';
 import 'package:drift/isolate.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:http/http.dart' as http;
+import 'package:story_reader/browser_download_loop.dart';
+import 'package:story_reader/browser_fetch.dart';
 import 'package:story_reader/client.dart';
 import 'package:story_reader/db.dart';
 import 'package:story_reader/download_outcome.dart';
 import 'package:story_reader/main.dart';
 import 'package:story_reader/rr.dart';
 import 'package:story_reader/series_data.dart';
+import 'package:story_reader/sh_browser.dart';
 import 'package:story_reader/sh_toc.dart';
 
 void startDownloadManager() {
   if (_downloadManager == null) {
     _chapterDownloadManager();
   }
+  // ScribbleHub chapter pages need a real browser (Cloudflare managed
+  // challenge, 2026-10): WebViews exist only on the main isolate, so those
+  // chapters are drained here by [BrowserDownloadLoop] while the isolate
+  // keeps handling images and RoyalRoad — [isolateSkipsChapter] is the
+  // hand-off rule that keeps the two loops off each other's chapters.
+  if (BrowserFetcher.isSupported) {
+    _browserLoop ??= BrowserDownloadLoop(
+      fetcher: BrowserFetcher.instance,
+      store: AppDBBrowserStore(appDB),
+      parseChapter: parseScribbleHubChapterOffIsolate,
+      onActiveChanged: (active) {
+        _browserLoopActive = active;
+        _updateActive();
+      },
+    );
+    _browserLoop!.start();
+  }
 }
 
 void stopDownloadManager() {
+  _browserLoop?.cancel();
   var d = _downloadManager;
   if (d != null) {
     d.kill();
@@ -39,6 +60,15 @@ final ValueNotifier<bool> _downloadManagerActive = (() {
   return v;
 })();
 Isolate? _downloadManager;
+BrowserDownloadLoop? _browserLoop;
+bool _isolateActive = false;
+bool _browserLoopActive = false;
+
+/// The Downloads page "active" indicator is truthful for *both* workers:
+/// active while either the isolate or the browser loop is draining.
+void _updateActive() {
+  _downloadManagerActive.value = _isolateActive || _browserLoopActive;
+}
 
 
 
@@ -46,12 +76,19 @@ void _chapterDownloadManager() async {
   var client = httpClient();
   var connection = await appDB.serializableConnection();
   var exit = ReceivePort();
+  // WebView-only sites (ScribbleHub) belong to the main-isolate browser
+  // loop; tell the download isolate to skip them so no chapter is ever
+  // fetched twice at once. On platforms without WebViews (Linux) the flag
+  // stays false and the isolate keeps the old HTTP behaviour.
+  var skipScribbleHub = BrowserFetcher.isSupported;
   exit.listen((_) {
     _downloadManager = null;
-    _downloadManagerActive.value = false;
+    _isolateActive = false;
+    _updateActive();
   });
-  _downloadManagerActive.value = true;
-  var i = await Isolate.spawn((_) async {
+  _isolateActive = true;
+  _updateActive();
+  var i = await Isolate.spawn((skipScribbleHub) async {
     var db = AppDB(await connection.connect());
     while (true) {
       var l = await db.queuedChapters();
@@ -76,6 +113,9 @@ void _chapterDownloadManager() async {
           await db.setImageData(im.id, await (await client.send(req)).stream.toBytes());
         }
         for (var c in l) {
+          if (isolateSkipsChapter(skipScribbleHub, c.site)) {
+            continue; // owned by the main-isolate browser loop
+          }
           var s = sl.firstWhere((s) => s.site == c.site && s.id == c.id);
           try {
             Response<ChapterData> resp;
@@ -144,12 +184,6 @@ void _chapterDownloadManager() async {
       }
       await Future.delayed(backoff);
     }
-  }, [], errorsAreFatal: true, debugName: "Download Isolate", onExit: exit.sendPort);
+  }, skipScribbleHub, errorsAreFatal: true, debugName: "Download Isolate", onExit: exit.sendPort);
   _downloadManager = i;
 }
-
-
-
-
-
-

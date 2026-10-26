@@ -159,18 +159,17 @@ abstract class SHAPI extends ChopperService {
   Future<Response> _chapterContents(@Path("idSlug") String idSlug, @Path("id") String id);
 
   Future<Response<ChapterData>> chapterContents(SeriesData series, String id) async {
-    var resp = await _chapterContents("${series.id}-${slugify(series.name)}", id);
+    var url = scribbleHubChapterUrl(series.id, series.name, id);
+    var resp = await _chapterContents(url.pathSegments[1], id);
     if (isBotChallenge(resp.statusCode, resp.bodyString)) {
-      throw _shBlocked("https://www.scribblehub.com/read/${series.id}/chapter/$id/",
-          resp.statusCode, resp.bodyString);
+      throw _shBlocked(url.toString(), resp.statusCode, resp.bodyString);
     }
     if (!resp.isSuccessful) {
       return resp.copyWith();
     }
-    var body = parse(resp.bodyString);
-    return resp.copyWith(
-        body: ChapterData(
-            id, body.getElementsByClassName("chapter-title").first.text, RichTextDocument.html(body.getElementById("chp_raw")!.nodes)));
+    // StateError on missing content nodes: the download isolate reads that
+    // as "a real 200 page that can never parse" and dequeues the chapter.
+    return resp.copyWith(body: parseScribbleHubChapter(resp.bodyString, id));
   }
 
   @Get(path: "series/{id}/{slugged}/")
@@ -246,6 +245,39 @@ String slugify(String name) {
   var slugged = name.replaceAll(RegExp(r"[^a-zA-Z ]"), "").replaceAll(" ", "-").replaceAll(RegExp(r"-+"), "-").toLowerCase();
   //print(slugged);
   return slugged;
+}
+
+/// Canonical chapter page URL, e.g.
+/// `https://www.scribblehub.com/read/623932-on-astral-tides/chapter/2640407/`.
+/// Shared by the HTTP path ([SHAPI.chapterContents]) and the WebView paths
+/// (`lib/browser_download_loop.dart`, `lib/sh_browser.dart`).
+Uri scribbleHubChapterUrl(String seriesId, String seriesName, String chapterId) => Uri.parse(
+    "https://www.scribblehub.com/read/$seriesId-${slugify(seriesName)}/chapter/$chapterId/");
+
+/// Whether a ScribbleHub chapter page body already carries the chapter
+/// content node (used as the WebView `isReady` predicate).
+bool isScribbleHubChapterReady(String html) => html.contains("id=\"chp_raw\"");
+
+/// Pure HTML -> [ChapterData] parse of a ScribbleHub chapter page: title from
+/// `.chapter-title`, content from the `#chp_raw` node subtree. Shared by the
+/// HTTP client and the WebView download loop so both produce byte-identical
+/// chapters.
+///
+/// Throws [StateError] when either node is missing — including on a
+/// Cloudflare/Anubis interstitial, which never carries chapter markup. Callers
+/// that already screened challenge pages (`classifyChapterFetch`) treat that
+/// as "page can never parse" and dequeue the chapter.
+ChapterData parseScribbleHubChapter(String html, String chapterId) {
+  final doc = parse(html);
+  final titles = doc.getElementsByClassName("chapter-title");
+  if (titles.isEmpty) {
+    throw StateError("ScribbleHub chapter page has no .chapter-title element");
+  }
+  final content = doc.getElementById("chp_raw");
+  if (content == null) {
+    throw StateError("ScribbleHub chapter page has no #chp_raw element");
+  }
+  return ChapterData(chapterId, titles.first.text, RichTextDocument.html(content.nodes));
 }
 
 final class RetryInterceptor implements Interceptor {
