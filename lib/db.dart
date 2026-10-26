@@ -9,6 +9,7 @@ import 'package:path/path.dart' as path;
 import 'dart:io';
 import 'package:sqlite3_flutter_libs/sqlite3_flutter_libs.dart';
 import 'package:sqlite3/sqlite3.dart';
+import 'package:story_reader/chapter_number.dart';
 import 'package:story_reader/rich_text_tree.dart';
 import 'package:story_reader/series_data.dart';
 
@@ -41,6 +42,10 @@ class SeriesTable extends Table {
   BlobColumn get thumbnail => blob().nullable()();
 
   IntColumn get lastRead => integer().nullable()();
+
+  /// Stable identity of the last-read chapter (its site chapter id). Takes
+  /// priority over [lastRead] when set; [lastRead] is kept for the transition.
+  TextColumn get lastReadChapterID => text().nullable()();
   DateTimeColumn get lastReadDate => dateTime().nullable()();
   
   IntColumn get thumbnailWidth => integer().nullable()();
@@ -53,9 +58,29 @@ class SeriesTable extends Table {
   String? get tableName => "series";
 }
 
+/// Relationship of a stored chapter to the live upstream table of contents.
+enum ChapterUpstreamState {
+  /// Present in the live TOC.
+  upstream,
+
+  /// The author removed it from the TOC; content and scroll position are kept.
+  missingUpstream,
+
+  /// Still published, but the upstream title no longer matches [Chapters.name].
+  renamed,
+}
+
+/// Sentinel for `chapters.position` meaning "not in the live TOC" (removed
+/// upstream or never reconciled). This is Int64.MAX_VALUE: ordering by
+/// position ASC puts such rows after every live chapter.
+const int kNoPosition = 9223372036854775807;
+
 class Chapters extends Table {
   IntColumn get site => intEnum<Site>().references(SeriesTable, #site)();
   TextColumn get id => text().references(SeriesTable, #id)();
+
+  /// Legacy 0-based TOC index at download time; part of the primary key so it
+  /// is never rewritten once a chapter exists. Use [position] for ordering.
   IntColumn get number => integer()();
 
   TextColumn get chapterID => text()();
@@ -63,6 +88,17 @@ class Chapters extends Table {
   BlobColumn get content => blob().nullable()();
   IntColumn get scrollPosition => integer().nullable()();
   BoolColumn get queued => boolean()();
+
+  /// Current index in the live table of contents; [kNoPosition] when the
+  /// chapter is not in the live TOC (removed upstream or never reconciled).
+  IntColumn get position => integer().withDefault(Constant(kNoPosition))();
+
+  /// The book's own chapter number parsed from the title, null when absent.
+  IntColumn get chapterNumber => integer().nullable()();
+
+  IntColumn get upstreamState => intEnum<ChapterUpstreamState>().withDefault(const Constant(0))();
+
+  BoolColumn get isRead => boolean().withDefault(const Constant(false))();
 
   @override
   Set<Column<Object>>? get primaryKey => {site, id, number};
@@ -223,7 +259,9 @@ class AppDB extends _$AppDB {
       await delete(this.chapterImages).go();
       await batch((batch) async {
         batch.insertAll(seriesTable, series);
-        batch.insertAll(this.chapters, chapters);
+        // insertOrReplace so a payload that still carries v10-era duplicate
+        // chapterIDs collapses to one row instead of violating the unique index.
+        batch.insertAll(this.chapters, chapters, mode: InsertMode.insertOrReplace);
         batch.insertAll(this.chapterImages, chapterImages);
       });
     });
@@ -231,13 +269,17 @@ class AppDB extends _$AppDB {
   
   
   Stream<ChapterStatus> chapterStatus(Site site, String id, int number) {
-    return (select(chapters)..where((c) => c.id.equals(id) & c.site.equals(site.index) & c.number.equals(number)))
+    // Call sites pass a live TOC index; match the reconciled `position` first
+    // and fall back to the legacy `number` slot for never-reconciled rows.
+    return (select(chapters)
+          ..where((c) =>
+              c.id.equals(id) & c.site.equals(site.index) & (c.position.equals(number) | c.number.equals(number))))
         .watch()
         .map((cl) {
-      if (cl.length != 1) {
+      var c = cl.where((c) => c.position == number).firstOrNull ?? cl.where((c) => c.number == number).firstOrNull;
+      if (c == null) {
         return ChapterStatus.online;
       }
-      var c = cl.first;
       if (c.content != null) {
         return ChapterStatus.downloaded;
       }
@@ -262,15 +304,31 @@ class AppDB extends _$AppDB {
   }
 
   Future<void> deleteChapter(Site site, String id, int number) {
-    var c = Chapter(site: site, id: id, number: number, chapterID: "", queued: false, name: '');
     return transaction(() async {
       var s = await (select(seriesTable)..where((s) => s.site.equals(site.index) & s.id.equals(id))).getSingleOrNull();
-      if (s != null && s.lastRead == number) {
-        await setLastRead(site, id, null);
+      var doomed = await (select(chapters)
+            ..where((c) => c.site.equals(site.index) & c.id.equals(id) & c.number.equals(number)))
+          .get();
+      for (var c in doomed) {
+        await (delete(chapters)..whereSamePrimaryKey(c)).go();
       }
-      await (delete(chapters)..whereSamePrimaryKey(c)).go();
+      if (s != null) {
+        if (s.lastRead == number) {
+          await setLastRead(site, id, null);
+        } else if (s.lastReadChapterID != null && doomed.any((c) => c.chapterID == s.lastReadChapterID)) {
+          await setLastReadChapter(site, id, null);
+        }
+      }
     });
   }
+
+  /// Canonical chapter ordering, used everywhere chapters are listed:
+  /// live TOC position first, then the book's own chapter number, then name.
+  List<OrderingTerm Function($ChaptersTable)> get canonicalChapterOrder => [
+        (c) => OrderingTerm.asc(c.position),
+        (c) => OrderingTerm.asc(c.chapterNumber),
+        (c) => OrderingTerm.asc(c.name),
+      ];
 
   SimpleSelectStatement<$ChaptersTable, Chapter> _queuedChapters() {
     return (select(chapters)
@@ -278,7 +336,7 @@ class AppDB extends _$AppDB {
       ..orderBy([
         (c) => OrderingTerm(expression: c.site),
         (c) => OrderingTerm(expression: c.id),
-        (c) => OrderingTerm(expression: c.number)
+        ...canonicalChapterOrder,
       ]));
   }
   
@@ -307,17 +365,78 @@ class AppDB extends _$AppDB {
     );
   }
 
+  /// Sets the legacy numeric marker and, when a row can be resolved for it,
+  /// the stable [Series.lastReadChapterID] that takes priority over it.
   Future<void> setLastRead(Site site, String id, int? last) {
+    return transaction(() async {
+      String? chapterID;
+      if (last != null) {
+        var rows = await (select(chapters)
+              ..where((c) =>
+                  c.site.equals(site.index) & c.id.equals(id) & (c.position.equals(last) | c.number.equals(last))))
+            .get();
+        var row = rows.where((c) => c.position == last).firstOrNull ??
+            rows.where((c) => c.number == last).firstOrNull;
+        if (row != null && row.chapterID.isNotEmpty) {
+          chapterID = row.chapterID;
+        }
+      }
+      await customUpdate(
+        "UPDATE series SET last_read = ?, last_read_chapter_i_d = ? WHERE site = ? AND id = ?",
+        variables: [
+          Variable(last),
+          Variable<String>(chapterID),
+          Variable.withInt(site.index),
+          Variable.withString(id),
+        ],
+        updates: {seriesTable},
+        updateKind: UpdateKind.update,
+      );
+    });
+  }
+
+  /// Sets the stable last-read marker by site chapter id. Takes priority over
+  /// the legacy numeric [setLastRead] marker.
+  Future<void> setLastReadChapter(Site site, String id, String? chapterID) {
     return customUpdate(
-      "UPDATE series SET last_read = ? WHERE site = ? AND id = ?",
+      "UPDATE series SET last_read_chapter_i_d = ? WHERE site = ? AND id = ?",
       variables: [
-        Variable(last),
+        Variable<String>(chapterID),
         Variable.withInt(site.index),
         Variable.withString(id),
       ],
       updates: {seriesTable},
       updateKind: UpdateKind.update,
     );
+  }
+
+  /// Resolves the last-read chapter: `lastReadChapterID` wins when set and a
+  /// matching row exists, otherwise the legacy `lastRead` numeric marker.
+  Future<Chapter?> lastReadChapter(Site site, String id) {
+    return transaction(() async {
+      var s = await (select(seriesTable)..where((s) => s.site.equals(site.index) & s.id.equals(id))).getSingleOrNull();
+      if (s == null) {
+        return null;
+      }
+      if (s.lastReadChapterID != null) {
+        var byId = await (select(chapters)
+              ..where((c) => c.site.equals(site.index) & c.id.equals(id) & c.chapterID.equals(s.lastReadChapterID!)))
+            .get();
+        var row = byId.firstOrNull;
+        if (row != null) {
+          return row;
+        }
+      }
+      if (s.lastRead != null) {
+        var rows = await (select(chapters)
+              ..where((c) =>
+                  c.site.equals(site.index) & c.id.equals(id) & (c.position.equals(s.lastRead!) | c.number.equals(s.lastRead!))))
+            .get();
+        return rows.where((c) => c.position == s.lastRead).firstOrNull ??
+            rows.where((c) => c.number == s.lastRead).firstOrNull;
+      }
+      return null;
+    });
   }
   
   Future<void> updateLastReadDate(Site site, String id) {
@@ -352,30 +471,60 @@ class AppDB extends _$AppDB {
       var imageIDS = await Future.wait(contents.imageSources.map((url) => addImage(url.toString())).toList());
       //print(imageIDS);
       contents.rewriteImageIndices(imageIDS);
-      var c =
-        Chapter(site: site, id: id, number: number, queued: false,
-            content: Uint8List.fromList(_gzip.encoder.convert(_utf8.encoder.convert(jsonEncode(contents.toJson())))),
-            chapterID: chapterID, name: name);
-      var res = await (select(chapters)..whereSamePrimaryKey(c)).get();
-      if (res.isNotEmpty && res[0].queued) {
-        await into(chapters).insertOnConflictUpdate(c);
+      var content = Uint8List.fromList(_gzip.encoder.convert(_utf8.encoder.convert(jsonEncode(contents.toJson()))));
+      // The row identified by the stable chapterID is the save target; the
+      // legacy (site, id, number) slot is only a fallback for pre-M1 callers.
+      var byID = await (select(chapters)
+            ..where((c) => c.site.equals(site.index) & c.id.equals(id) & c.chapterID.equals(chapterID)))
+          .get();
+      var target = byID.firstOrNull;
+      if (target == null) {
+        var byNumber = await (select(chapters)
+              ..where((c) => c.site.equals(site.index) & c.id.equals(id) & c.number.equals(number)))
+            .get();
+        target = byNumber.firstOrNull;
+      }
+      // Only store content into a row that is actually queued.
+      if (target != null && target.queued) {
+        await (update(chapters)..whereSamePrimaryKey(target)).write(ChaptersCompanion(
+              chapterID: Value(chapterID),
+              name: Value(name),
+              content: Value(content),
+              chapterNumber: Value(parseChapterNumber(name)),
+              queued: const Value(false),
+            ));
       }
     });
   }
 
   Future<void> queueChapter(Site site, String name, String id, int number, String chapterID) {
-    var c = Chapter(site: site, name: name, id: id, number: number, queued: true, chapterID: chapterID);
     return transaction(() async {
-      var rc = await (select(chapters)
-            ..whereSamePrimaryKey(c)
-            ..limit(1))
+      var rows = await (select(chapters)
+            ..where((c) => c.site.equals(site.index) & c.id.equals(id) & c.chapterID.equals(chapterID)))
           .get();
-      if (rc.isEmpty) {
-        await into(chapters).insert(c, mode: InsertMode.insert);
-      } else {
-        if (rc.first.content == null) {
-          await (update(chapters)..whereSamePrimaryKey(c)).write(c);
-        }
+      var row = rows.firstOrNull;
+      if (row == null) {
+        var existing = await (select(chapters)..where((c) => c.site.equals(site.index) & c.id.equals(id))).get();
+        var used = existing.map((c) => c.number).toSet();
+        await into(chapters).insert(Chapter(
+            site: site,
+            name: name,
+            id: id,
+            number: freeNumber(number, used),
+            queued: true,
+            chapterID: chapterID,
+            position: number,
+            chapterNumber: parseChapterNumber(name),
+            upstreamState: ChapterUpstreamState.upstream,
+            isRead: false));
+      } else if (row.content == null) {
+        await (update(chapters)..whereSamePrimaryKey(row)).write(ChaptersCompanion(
+              name: Value(name),
+              queued: const Value(true),
+              position: Value(number),
+              chapterNumber: Value(parseChapterNumber(name)),
+              upstreamState: const Value(ChapterUpstreamState.upstream),
+            ));
       }
     });
   }
@@ -383,15 +532,37 @@ class AppDB extends _$AppDB {
   Future<void> queueChapters(Site site, String id, List<String> names, List<int> numbers, List<String> chapterIDs, [bool queue = true]) {
     return transaction(() async {
       var rc = await (select(chapters)
-            ..where((c) => c.site.equals(site.index) & c.id.equals(id) & c.number.isIn(numbers)))
+            ..where((c) => c.site.equals(site.index) & c.id.equals(id)))
           .get();
-      for (var (i, n) in numbers.indexed) {
-        var a = rc.indexWhere((c) => c.number == n);
-        if (a == -1) {
-          rc.add(Chapter(site: site, name: names[i], id: id, number: n, chapterID: chapterIDs[i], queued: queue));
+      var byID = <String, Chapter>{ for (var c in rc) c.chapterID: c };
+      var used = rc.map((c) => c.number).toSet();
+      for (var (i, cid) in chapterIDs.indexed) {
+        var row = byID[cid];
+        if (row == null) {
+          var fresh = Chapter(
+              site: site,
+              name: names[i],
+              id: id,
+              number: freeNumber(numbers[i], used),
+              chapterID: cid,
+              queued: queue,
+              position: numbers[i],
+              chapterNumber: parseChapterNumber(names[i]),
+              upstreamState: ChapterUpstreamState.upstream,
+              isRead: false);
+          byID[cid] = fresh;
+          rc.add(fresh);
         } else {
-          if (!queue || rc[a].content == null) {
-            rc[a] = rc[a].copyWith(queued: queue);
+          if (!queue || row.content == null) {
+            var updated = row.copyWith(
+              queued: queue,
+              position: numbers[i],
+              chapterNumber: Value(parseChapterNumber(names[i])),
+              upstreamState: ChapterUpstreamState.upstream,
+              name: row.content == null ? names[i] : row.name,
+            );
+            byID[cid] = updated;
+            rc[rc.indexOf(row)] = updated;
           }
         }
       }
@@ -402,16 +573,15 @@ class AppDB extends _$AppDB {
   }
 
   Future<void> dequeueChapter(Site site, String id, int number) {
-    var c = Chapter(site: site, id: id, number: number, queued: false, chapterID: "", name: '');
     return transaction(() async {
-      var rc = await (select(chapters)
-            ..whereSamePrimaryKey(c)
-            ..limit(1))
+      var rows = await (select(chapters)
+            ..where((c) =>
+                c.site.equals(site.index) & c.id.equals(id) & (c.position.equals(number) | c.number.equals(number))))
           .get();
-      if (rc.isNotEmpty) {
-        if (rc.first.content == null) {
-          await (update(chapters)..whereSamePrimaryKey(c)).write(c);
-        }
+      var row = rows.where((c) => c.position == number).firstOrNull ??
+          rows.where((c) => c.number == number).firstOrNull;
+      if (row != null && row.content == null) {
+        await (update(chapters)..whereSamePrimaryKey(row)).write(const ChaptersCompanion(queued: Value(false)));
       }
     });
   }
@@ -463,15 +633,159 @@ class AppDB extends _$AppDB {
   SimpleSelectStatement<$ChaptersTable, Chapter> _chaptersFor(SeriesData s) {
     return select(chapters)
       ..where((c) => c.id.equals(s.id) & c.site.equals(s.site.index) & c.content.isNotNull())
-      ..orderBy([(c) => OrderingTerm.asc(c.number)]);
+      ..orderBy(canonicalChapterOrder);
+  }
+
+  /// Picks a free legacy `number` slot for a fresh row: [preferred] when
+  /// unused, otherwise the next unused slot above it. `number` is part of the
+  /// primary key, so a live TOC index can collide with a retained row whose
+  /// chapter was deleted upstream.
+  static int freeNumber(int preferred, Set<int> used) {
+    var n = preferred;
+    while (used.contains(n)) {
+      n++;
+    }
+    return n;
+  }
+
+  /// The downloaded-but-unread, still-published chapters of a series in
+  /// canonical order — the selection used for EPUB export batches.
+  Future<List<Chapter>> nextUnreadChapters(Site site, String id, int limit) {
+    return (select(chapters)
+          ..where((c) =>
+              c.site.equals(site.index) &
+              c.id.equals(id) &
+              c.content.isNotNull() &
+              c.isRead.equals(false) &
+              c.upstreamState.isNotInValues([ChapterUpstreamState.missingUpstream]))
+          ..orderBy(canonicalChapterOrder)
+          ..limit(limit))
+        .get();
+  }
+
+  Future<void> setRead(Site site, String id, String chapterID, bool read) {
+    return (update(chapters)
+          ..where((c) => c.site.equals(site.index) & c.id.equals(id) & c.chapterID.equals(chapterID)))
+        .write(ChaptersCompanion(isRead: Value(read)));
+  }
+
+  /// Repairs the v10-era corruption where one `chapterID` occupies several
+  /// `number` slots: keeps exactly one row per `(site, id, chapterID)` — the
+  /// one with content (highest `number` among content-bearing rows, so its
+  /// name+content+scrollPosition stay together), else the highest `number`.
+  /// Returns the number of rows deleted. Rows with an empty `chapterID` have
+  /// no stable identity and are left alone.
+  Future<int> deduplicateChapters({Site? site, String? id}) async {
+    return transaction(() async {
+      var query = select(chapters);
+      if (site != null) {
+        query.where((c) => c.site.equals(site.index));
+      }
+      if (id != null) {
+        query.where((c) => c.id.equals(id));
+      }
+      var all = await query.get();
+      var groups = groupBy(all, (Chapter c) => (c.site, c.id, c.chapterID));
+      var doomed = <Chapter>[];
+      for (var group in groups.entries) {
+        if (group.key.$3.isEmpty || group.value.length < 2) {
+          continue;
+        }
+        var rows = group.value.toList()
+          ..sort((a, b) {
+            var ca = a.content != null ? 1 : 0;
+            var cb = b.content != null ? 1 : 0;
+            if (ca != cb) {
+              return cb.compareTo(ca); // content-bearing rows win
+            }
+            return b.number.compareTo(a.number); // newest write wins
+          });
+        doomed.addAll(rows.skip(1));
+      }
+      for (var c in doomed) {
+        await (delete(chapters)..whereSamePrimaryKey(c)).go();
+      }
+      return doomed.length;
+    });
+  }
+
+  /// Aligns stored chapters with the live upstream table of contents.
+  ///
+  /// * Live TOC entries are upserted in TOC order (`position = index`,
+  ///   `chapterNumber = parseChapterNumber(name)`); a name mismatch marks the
+  ///   row `renamed` but **never touches its content**; a previously missing
+  ///   chapter that reappears returns to `upstream`.
+  /// * Local rows whose `chapterID` is absent from [toc] become
+  ///   `missingUpstream` with `position = kNoPosition` and `queued = false`,
+  ///   **keeping** their content, scroll position and name — so a deleted
+  ///   chapter sorts after all live ones instead of being lost.
+  ///
+  /// The `lastReadChapterID` marker is a stable id and needs no adjustment.
+  Future<void> reconcileChapters(Site site, String seriesId, List<ChapterData> toc) {
+    return transaction(() async {
+      var existing = await (select(chapters)
+            ..where((c) => c.site.equals(site.index) & c.id.equals(seriesId)))
+          .get();
+      var byID = <String, Chapter>{ for (var c in existing) c.chapterID: c };
+      var usedNumbers = existing.map((c) => c.number).toSet();
+
+      for (var (i, entry) in toc.indexed) {
+        var parsed = parseChapterNumber(entry.name);
+        var row = byID[entry.id];
+        if (row == null) {
+          await into(chapters).insert(Chapter(
+              site: site,
+              id: seriesId,
+              number: freeNumber(i, usedNumbers),
+              chapterID: entry.id,
+              name: entry.name,
+              queued: false,
+              position: i,
+              chapterNumber: parsed,
+              upstreamState: ChapterUpstreamState.upstream,
+              isRead: false));
+          continue;
+        }
+        ChapterUpstreamState state;
+        if (row.upstreamState == ChapterUpstreamState.missingUpstream) {
+          // Re-uploaded by the author: back to normal (re-download happens
+          // through the normal queue if its content is absent).
+          state = ChapterUpstreamState.upstream;
+        } else {
+          state = row.name != entry.name ? ChapterUpstreamState.renamed : ChapterUpstreamState.upstream;
+        }
+        // Name and content are deliberately untouched: `name` stays the local
+        // copy so the renamed state remains detectable until a re-download.
+        await (update(chapters)..whereSamePrimaryKey(row)).write(ChaptersCompanion(
+              position: Value(i),
+              chapterNumber: Value(parsed),
+              upstreamState: Value(state),
+            ));
+      }
+
+      var tocIDs = toc.map((t) => t.id).toSet();
+      for (var row in existing) {
+        if (tocIDs.contains(row.chapterID)) {
+          continue;
+        }
+        await (update(chapters)..whereSamePrimaryKey(row)).write(const ChaptersCompanion(
+              position: Value(kNoPosition),
+              upstreamState: Value(ChapterUpstreamState.missingUpstream),
+              queued: Value(false),
+            ));
+      }
+    });
   }
 
   @override
-  int get schemaVersion => 10;
+  int get schemaVersion => 11;
 
   @override
   MigrationStrategy get migration {
-    return MigrationStrategy(onUpgrade: (Migrator m, int from, int to) async {
+    return MigrationStrategy(onCreate: (m) async {
+      await m.createAll();
+      await customStatement(_uniqueChapterIndexStatement);
+    }, onUpgrade: (Migrator m, int from, int to) async {
       await transaction(() async {
         if (from < 2) {
           await m.addColumn(seriesTable, seriesTable.lastReadDate);
@@ -551,6 +865,53 @@ class AppDB extends _$AppDB {
           b.replaceAll(chapters, cs);
         });
       }
+      if (from < 11) {
+        // M1 — stable chapter identity. All new columns are defaulted or
+        // nullable, so no table rebuild is needed.
+        await m.addColumn(chapters, chapters.position);
+        await m.addColumn(chapters, chapters.chapterNumber);
+        await m.addColumn(chapters, chapters.upstreamState);
+        await m.addColumn(chapters, chapters.isRead);
+        await m.addColumn(seriesTable, seriesTable.lastReadChapterID);
+
+        // Repair v10 duplicate rows before the unique index can exist.
+        await deduplicateChapters();
+
+        // Best guess until the first reconcile: the legacy TOC index was the
+        // position when the row was written.
+        await customStatement("UPDATE chapters SET position = number");
+
+        // Derive the book's own chapter number from the stored title.
+        var renamed = (await select(chapters).get())
+            .map((c) => c.copyWith(chapterNumber: Value(parseChapterNumber(c.name))))
+            .where((c) => c.chapterNumber != null)
+            .toList();
+        await batch((b) {
+          b.replaceAll(chapters, renamed);
+        });
+
+        // Promote lastRead to the stable chapterID when the slot is unique.
+        for (var s in await select(seriesTable).get()) {
+          var last = s.lastRead;
+          if (last == null) {
+            continue;
+          }
+          var rows = await (select(chapters)
+                ..where((c) => c.site.equals(s.site.index) & c.id.equals(s.id) & c.number.equals(last)))
+              .get();
+          if (rows.length == 1 && rows.single.chapterID.isNotEmpty) {
+            await (update(seriesTable)..whereSamePrimaryKey(s))
+                .write(SeriesTableCompanion(lastReadChapterID: Value(rows.single.chapterID)));
+          }
+        }
+
+        await customStatement(_uniqueChapterIndexStatement);
+      }
     });
   }
 }
+
+/// Drift has no declarative multi-column unique index. Column names are the
+/// drift-generated snake_case names (`chapterID` -> `chapter_i_d`).
+const String _uniqueChapterIndexStatement =
+    "CREATE UNIQUE INDEX IF NOT EXISTS chapters_chapter_key ON chapters (site, id, chapter_i_d)";
