@@ -174,7 +174,8 @@ void main() {
       final c = chapter("103");
       // A challenge document the fetcher still returned must map to
       // `blocked` — never `dequeue`.
-      expect(classifyBrowserChapterFetch(challengePage, false),
+      expect(classifyBrowserChapterFetch(challengePage, false,
+              site: Site.scribbleHub),
           BrowserChapterAction.blocked);
       final fetcher = FakeFetcher({urlFor("103"): challengePage});
       final store = FakeStore([c]);

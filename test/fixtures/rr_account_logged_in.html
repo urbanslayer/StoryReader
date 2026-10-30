@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head><title>Account | Royal Road</title></head>
+<body>
+<nav class="navbar">
+  <a href="/">Royal Road</a>
+  <div class="dropdown">
+    <a href="/profile/placeholder-reader">Placeholder Reader</a>
+    <ul class="dropdown-menu">
+      <li><a href="/my/follows">Follows</a></li>
+      <li><a href="/Account/Logout" class="signout">Sign Out</a></li>
+    </ul>
+  </div>
+</nav>
+<main>
+  <h1>My Account</h1>
+  <form action="/account" method="post">
+    <label>Name</label>
+    <input type="text" name="Name" value="Placeholder Reader" />
+    <label>Email</label>
+    <input type="email" name="Email" value="reader@example.invalid" />
+    <button type="submit">Save</button>
+  </form>
+</main>
+</body>
+</html>

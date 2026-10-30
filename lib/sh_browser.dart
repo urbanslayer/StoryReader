@@ -21,7 +21,7 @@ Future<ChapterData> fetchScribbleHubChapterViaBrowser(
     String seriesId, String seriesName, String chapterId) async {
   final html = await BrowserFetcher.instance.fetchHtml(
       scribbleHubChapterUrl(seriesId, seriesName, chapterId),
-      isReady: isScribbleHubChapterReady);
+      isReady: isScribbleHubChapterFinal);
   return parseScribbleHubChapterOffIsolate(html, chapterId);
 }
 

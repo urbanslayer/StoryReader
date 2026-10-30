@@ -13,6 +13,7 @@ import 'package:story_reader/db.dart';
 import 'package:story_reader/download_manager.dart';
 import 'package:story_reader/pages/load_network_page.dart';
 import 'package:story_reader/pages/read_page.dart';
+import 'package:story_reader/pages/royalroad_account_page.dart';
 import 'package:story_reader/pages/series_net_page.dart';
 import 'package:story_reader/pages/series_page.dart';
 import 'package:story_reader/pages/share_network_page.dart';
@@ -45,6 +46,7 @@ final router = GoRouter(routes: [
   GoRoute(path: "/shareNet", pageBuilder: (c, s) => MaterialPage(child: RootRestorationScope(restorationId: "shareNet", child: ShareNetworkPage()))),
   GoRoute(path: "/loadNet", pageBuilder: (c, s) => MaterialPage(child: RootRestorationScope(restorationId: "loadNet", child: LoadNetworkPage()))),
   GoRoute(path: "/licenses", pageBuilder: (c, s) => MaterialPage(child: LicensePage())),
+  GoRoute(path: "/rrAccount", pageBuilder: (c, s) => MaterialPage(child: RootRestorationScope(restorationId: "rrAccount", child: RoyalRoadAccountPage()))),
   GoRoute(path: "/update", pageBuilder: (c, s) => MaterialPage(child: UpdatePage())),
   GoRoute(path: "/verify", pageBuilder: (c, s) {
     var e = s.extra as Map<String, dynamic>;

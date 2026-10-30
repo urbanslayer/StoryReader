@@ -258,6 +258,23 @@ Uri scribbleHubChapterUrl(String seriesId, String seriesName, String chapterId) 
 /// content node (used as the WebView `isReady` predicate).
 bool isScribbleHubChapterReady(String html) => html.contains("id=\"chp_raw\"");
 
+/// ScribbleHub's 404 / missing-chapter page (WordPress error layout: an
+/// `error404` body class, a "not found" title, or the theme's
+/// "page ... might never existed" copy). Such a page is final — waiting for
+/// `#chp_raw` on it burns the full WebView page budget on every retry.
+bool isScribbleHubNotFound(String html) {
+  final h = html.toLowerCase();
+  if (RegExp(r"<title[^>]*>[^<]*(404|not found)").hasMatch(h)) return true;
+  if (h.contains("error404") || h.contains("error-404")) return true;
+  return h.contains("oops! that page can't be found") ||
+      h.contains("might never existed");
+}
+
+/// Chapter fetch is "final" once the content node or the 404 marker is on
+/// screen — the poll loop must not wait on an error page.
+bool isScribbleHubChapterFinal(String html) =>
+    isScribbleHubChapterReady(html) || isScribbleHubNotFound(html);
+
 /// Pure HTML -> [ChapterData] parse of a ScribbleHub chapter page: title from
 /// `.chapter-title`, content from the `#chp_raw` node subtree. Shared by the
 /// HTTP client and the WebView download loop so both produce byte-identical

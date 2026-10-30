@@ -64,7 +64,7 @@ Future<ChapterData> fetchRoyalRoadChapterViaBrowser(
     [String chapterName = ""]) async {
   final html = await BrowserFetcher.instance.fetchHtml(
       royalRoadChapterUrl(seriesId, seriesName, chapterId, chapterName),
-      isReady: isRoyalRoadChapterReady);
+      isReady: isRoyalRoadChapterFinal);
   return parseRoyalRoadChapterOffIsolate(html, chapterId, chapterName);
 }
 

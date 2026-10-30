@@ -121,8 +121,22 @@ Future<ChapterData> directChapterParser(
 
 /// Decides one fetched-page outcome with the same table the download isolate
 /// uses ([classifyChapterFetch]); the WebView has no HTTP status, so a page
-/// that loaded at all is classified as a 200.
-BrowserChapterAction classifyBrowserChapterFetch(String html, bool parsed) {
+/// that loaded at all is classified as a 200 — except a page carrying the
+/// site's deleted/missing-chapter markers, which is treated exactly like an
+/// HTTP 404 ([BrowserChapterAction.dequeued]): retrying it would burn the
+/// full page budget forever.
+BrowserChapterAction classifyBrowserChapterFetch(String html, bool parsed,
+    {required Site site}) {
+  // Deleted / never-existed page (checked after the challenge rule baked
+  // into [classifyChapterFetch] would catch walls first — a challenge page
+  // matches neither marker set, but screen defensively anyway).
+  if (!parsed &&
+      !isBotChallenge(null, html) &&
+      (site == Site.royalRoad
+          ? isRoyalRoadNotFound(html)
+          : isScribbleHubNotFound(html))) {
+    return BrowserChapterAction.dequeued;
+  }
   final outcome = classifyChapterFetch(200, html, parsed);
   return switch (outcome) {
     DownloadOutcome.save => BrowserChapterAction.saved,
@@ -246,14 +260,17 @@ final class BrowserDownloadLoop {
   /// [BrowserChapterAction.blocked]/[BrowserChapterAction.failed] (queue
   /// untouched) so one bad chapter cannot kill the loop.
   Future<BrowserChapterAction> processChapter(BrowserQueuedChapter c) async {
+    // `*Final` predicates accept the site's deleted/404 page immediately:
+    // waiting 45 s for content that will never arrive would stall the queue
+    // on every retry round.
     final (url, isReady) = switch (c.site) {
       Site.scribbleHub => (
           scribbleHubChapterUrl(c.seriesId, c.seriesName, c.chapterID),
-          isScribbleHubChapterReady,
+          isScribbleHubChapterFinal,
         ),
       Site.royalRoad => (
           royalRoadChapterUrl(c.seriesId, c.seriesName, c.chapterID, c.name),
-          isRoyalRoadChapterReady,
+          isRoyalRoadChapterFinal,
         ),
     };
     final String html;
@@ -273,7 +290,8 @@ final class BrowserDownloadLoop {
     } catch (e) {
       parseError = e;
     }
-    final action = classifyBrowserChapterFetch(html, data != null);
+    final action =
+        classifyBrowserChapterFetch(html, data != null, site: c.site);
     switch (action) {
       case BrowserChapterAction.saved:
         await store.saveChapter(c, data!);

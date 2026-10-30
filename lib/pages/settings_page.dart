@@ -168,6 +168,12 @@ class _SettingsPageState extends State<SettingsPage> {
             Padding(
               padding: const EdgeInsets.all(8.0),
               child: Row(children: [
+                ElevatedButton(onPressed: () => router.push("/rrAccount"), child: Text("RoyalRoad account"))
+              ],),
+            ),
+            Padding(
+              padding: const EdgeInsets.all(8.0),
+              child: Row(children: [
                 ElevatedButton(onPressed: () => router.push("/shareNet"), child: Text("Share library"))
               ],),
             ),
