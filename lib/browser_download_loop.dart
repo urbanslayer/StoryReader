@@ -1,15 +1,16 @@
-// Main-isolate download loop for ScribbleHub chapters.
+// Main-isolate download loop for browser-walled chapter pages
+// (ScribbleHub and RoyalRoad).
 //
-// Why this exists: ScribbleHub chapter pages now sit behind a Cloudflare
-// managed challenge that no non-browser client can pass (HTTP 403 "Just a
-// moment..." for dart:io, curl, and even headless desktop browsers), so the
-// old HTTP path in the download isolate always failed and the queue never
-// drained. The fix (same approach reader apps like Mihon use) is to fetch
+// Why this exists: ScribbleHub chapter pages sit behind a Cloudflare
+// managed challenge and, since 2026-10, so does every royalroad.com page
+// (Cloudflare "Just a moment..." 403 on search/series/chapters; earlier the
+// same day it was an Anubis PoW page — no non-browser client passes either
+// wall). The fix (same approach reader apps like Mihon use) is to fetch
 // chapter pages through a real WebView — which only exists on the main (UI)
 // isolate on Android — while the background isolate keeps handling images
-// and RoyalRoad (see `lib/download_manager.dart`, whose isolate *skips*
-// ScribbleHub chapters while this loop is active, so the two loops can
-// never take the same chapter).
+// (see `lib/download_manager.dart`, whose isolate *skips* every
+// browser-owned site while this loop is active, so the two loops can never
+// take the same chapter).
 //
 // This file is deliberately pure Dart (no `package:flutter/...` and no
 // WebView plugin imports): the loop is tested with an injected [HtmlFetcher]
@@ -21,6 +22,7 @@ import 'dart:async';
 
 import 'package:story_reader/db.dart';
 import 'package:story_reader/download_outcome.dart';
+import 'package:story_reader/rr_parse.dart';
 import 'package:story_reader/series_data.dart';
 import 'package:story_reader/sh.dart';
 import 'package:story_reader/sh_toc.dart';
@@ -50,11 +52,16 @@ final class BrowserQueuedChapter {
   /// Queued chapter title / row name.
   final String name;
 
-  /// Series id (ScribbleHub numeric id).
+  /// Series id (site-numeric id).
   final String seriesId;
 
   /// Series title as stored locally (needed for the chapter URL slug).
   final String seriesName;
+
+  /// Which site owns this chapter; the loop picks URL, readiness predicate
+  /// and parser per site. Defaults to [Site.scribbleHub] (the loop's first
+  /// customer); production always sets it explicitly.
+  final Site site;
 
   const BrowserQueuedChapter({
     required this.number,
@@ -62,6 +69,7 @@ final class BrowserQueuedChapter {
     required this.name,
     required this.seriesId,
     required this.seriesName,
+    this.site = Site.scribbleHub,
   });
 }
 
@@ -95,13 +103,21 @@ enum BrowserChapterAction {
   failed,
 }
 
-/// Parses chapter HTML into a [ChapterData]; may run off-isolate in
-/// production. Throws (never returns null) when the page cannot parse.
-typedef ChapterParser = Future<ChapterData> Function(String html, String chapterId);
+/// Parses one queued chapter's HTML; may run off-isolate in production.
+/// Throws (never returns null) when the page cannot parse. Receives the
+/// queued chapter so per-site parsers get everything they need (RoyalRoad's
+/// parser wants the queued name for its `ChapterData`).
+typedef ChapterParser = Future<ChapterData> Function(
+    String html, BrowserQueuedChapter chapter);
 
-/// In-process parser (default; also what the unit tests use).
-Future<ChapterData> directChapterParser(String html, String chapterId) async =>
-    parseScribbleHubChapter(html, chapterId);
+/// In-process parser (default; also what the unit tests use): dispatches on
+/// the queued chapter's site.
+Future<ChapterData> directChapterParser(
+        String html, BrowserQueuedChapter chapter) =>
+    chapter.site == Site.royalRoad
+        ? Future.value(
+            parseRoyalRoadChapter(html, chapter.chapterID, chapter.name))
+        : Future.value(parseScribbleHubChapter(html, chapter.chapterID));
 
 /// Decides one fetched-page outcome with the same table the download isolate
 /// uses ([classifyChapterFetch]); the WebView has no HTTP status, so a page
@@ -117,15 +133,21 @@ BrowserChapterAction classifyBrowserChapterFetch(String html, bool parsed) {
   };
 }
 
-/// Whether the background download isolate must skip a chapter because the
-/// browser loop owns that site (true only for ScribbleHub while
-/// [skipScribbleHub] is set). Pure so the hand-off rule is unit-testable.
-bool isolateSkipsChapter(bool skipScribbleHub, Site site) =>
-    skipScribbleHub && site == Site.scribbleHub;
+/// Sites whose pages only load through a real WebView (Cloudflare/Anubis
+/// walls, measured 2026-10): they belong to this main-isolate loop whenever
+/// a WebView exists.
+const Set<Site> browserOwnedSites = {Site.scribbleHub, Site.royalRoad};
 
-/// Drains queued ScribbleHub chapters through [HtmlFetcher] on the main
-/// isolate. Started by `startDownloadManager()` when the platform supports
-/// WebViews; see `lib/browser_fetch.dart`.
+/// Whether the background download isolate must skip a chapter because the
+/// browser loop owns its site (true for every [browserOwnedSites] entry
+/// while [browserLoopActive] is set). Pure so the hand-off rule is
+/// unit-testable.
+bool isolateSkipsChapter(bool browserLoopActive, Site site) =>
+    browserLoopActive && browserOwnedSites.contains(site);
+
+/// Drains queued chapters of every [browserOwnedSites] site through
+/// [HtmlFetcher] on the main isolate. Started by `startDownloadManager()`
+/// when the platform supports WebViews; see `lib/browser_fetch.dart`.
 final class BrowserDownloadLoop {
   BrowserDownloadLoop({
     required this.fetcher,
@@ -224,10 +246,19 @@ final class BrowserDownloadLoop {
   /// [BrowserChapterAction.blocked]/[BrowserChapterAction.failed] (queue
   /// untouched) so one bad chapter cannot kill the loop.
   Future<BrowserChapterAction> processChapter(BrowserQueuedChapter c) async {
-    final url = scribbleHubChapterUrl(c.seriesId, c.seriesName, c.chapterID);
+    final (url, isReady) = switch (c.site) {
+      Site.scribbleHub => (
+          scribbleHubChapterUrl(c.seriesId, c.seriesName, c.chapterID),
+          isScribbleHubChapterReady,
+        ),
+      Site.royalRoad => (
+          royalRoadChapterUrl(c.seriesId, c.seriesName, c.chapterID, c.name),
+          isRoyalRoadChapterReady,
+        ),
+    };
     final String html;
     try {
-      html = await fetcher.fetchHtml(url, isReady: isScribbleHubChapterReady);
+      html = await fetcher.fetchHtml(url, isReady: isReady);
     } on SiteBlocked catch (e) {
       print("Chapter ${c.chapterID} blocked (${e.kind}); keeping queued");
       return BrowserChapterAction.blocked;
@@ -238,7 +269,7 @@ final class BrowserDownloadLoop {
     ChapterData? data;
     Object? parseError;
     try {
-      data = await parseChapter(html, c.chapterID);
+      data = await parseChapter(html, c);
     } catch (e) {
       parseError = e;
     }
@@ -262,9 +293,9 @@ final class BrowserDownloadLoop {
   }
 }
 
-/// Store adapter over the real database: queued ScribbleHub chapters joined
-/// with their series names, in the canonical order `_queuedChapters`
-/// already produces.
+/// Store adapter over the real database: queued chapters of every
+/// [browserOwnedSites] site joined with their series names, in the canonical
+/// order `_queuedChapters` already produces.
 final class AppDBBrowserStore implements BrowserChapterStore {
   AppDBBrowserStore(this.db);
 
@@ -272,9 +303,8 @@ final class AppDBBrowserStore implements BrowserChapterStore {
 
   @override
   Future<List<BrowserQueuedChapter>> queuedChapters() async {
-    final rows = (await db.queuedChapters())
-        .where((c) => c.site == Site.scribbleHub)
-        .toList();
+    final rows =
+        (await db.queuedChapters()).where((c) => browserOwnedSites.contains(c.site)).toList();
     if (rows.isEmpty) return [];
     final series = {for (final s in await db.series()) (s.site, s.id): s.name};
     return [
@@ -285,16 +315,18 @@ final class AppDBBrowserStore implements BrowserChapterStore {
           name: c.name,
           seriesId: c.id,
           seriesName: series[(c.site, c.id)] ?? "",
+          site: c.site,
         ),
     ];
   }
 
   @override
   Future<void> saveChapter(BrowserQueuedChapter chapter, ChapterData data) =>
-      db.saveChapter(Site.scribbleHub, chapter.seriesId, chapter.number,
+      db.saveChapter(chapter.site, chapter.seriesId, chapter.number,
           chapter.chapterID, data.content!, data.name, rawHtml: data.rawHtml);
 
   @override
   Future<void> dequeueChapter(BrowserQueuedChapter chapter) =>
-      db.dequeueChapterByID(Site.scribbleHub, chapter.seriesId, chapter.chapterID);
+      db.dequeueChapterByID(
+          chapter.site, chapter.seriesId, chapter.chapterID);
 }

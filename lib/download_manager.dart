@@ -6,6 +6,7 @@ import 'dart:isolate';
 import 'package:chopper/chopper.dart';
 import 'package:drift/isolate.dart';
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:story_reader/browser_download_loop.dart';
 import 'package:story_reader/browser_fetch.dart';
@@ -14,24 +15,25 @@ import 'package:story_reader/db.dart';
 import 'package:story_reader/download_outcome.dart';
 import 'package:story_reader/main.dart';
 import 'package:story_reader/rr.dart';
+import 'package:story_reader/rr_parse.dart';
 import 'package:story_reader/series_data.dart';
-import 'package:story_reader/sh_browser.dart';
+import 'package:story_reader/sh.dart';
 import 'package:story_reader/sh_toc.dart';
 
 void startDownloadManager() {
   if (_downloadManager == null) {
     _chapterDownloadManager();
   }
-  // ScribbleHub chapter pages need a real browser (Cloudflare managed
-  // challenge, 2026-10): WebViews exist only on the main isolate, so those
-  // chapters are drained here by [BrowserDownloadLoop] while the isolate
-  // keeps handling images and RoyalRoad — [isolateSkipsChapter] is the
-  // hand-off rule that keeps the two loops off each other's chapters.
+  // ScribbleHub and (since 2026-10) every RoyalRoad page need a real browser
+  // (Cloudflare managed challenge): WebViews exist only on the main isolate,
+  // so those chapters are drained here by [BrowserDownloadLoop] while the
+  // isolate keeps handling images — [isolateSkipsChapter] is the hand-off
+  // rule that keeps the two loops off each other's chapters.
   if (BrowserFetcher.isSupported) {
     _browserLoop ??= BrowserDownloadLoop(
       fetcher: BrowserFetcher.instance,
       store: AppDBBrowserStore(appDB),
-      parseChapter: parseScribbleHubChapterOffIsolate,
+      parseChapter: parseBrowserChapterOffIsolate,
       onActiveChanged: (active) {
         _browserLoopActive = active;
         _updateActive();
@@ -72,15 +74,28 @@ void _updateActive() {
 
 
 
+/// Browser-loop chapter parser run off the UI thread: dispatches on the
+/// queued chapter's site ([parseScribbleHubChapter] /
+/// [parseRoyalRoadChapter] are pure Dart and safe to ship).
+Future<ChapterData> parseBrowserChapterOffIsolate(
+        String html, BrowserQueuedChapter chapter) =>
+    compute(_browserParseTask,
+        (html, chapter.site.index, chapter.chapterID, chapter.name));
+
+ChapterData _browserParseTask((String, int, String, String) args) =>
+    args.$2 == Site.royalRoad.index
+        ? parseRoyalRoadChapter(args.$1, args.$3, args.$4)
+        : parseScribbleHubChapter(args.$1, args.$3);
+
 void _chapterDownloadManager() async {
   var client = httpClient();
   var connection = await appDB.serializableConnection();
   var exit = ReceivePort();
-  // WebView-only sites (ScribbleHub) belong to the main-isolate browser
-  // loop; tell the download isolate to skip them so no chapter is ever
-  // fetched twice at once. On platforms without WebViews (Linux) the flag
-  // stays false and the isolate keeps the old HTTP behaviour.
-  var skipScribbleHub = BrowserFetcher.isSupported;
+  // WebView-only sites (ScribbleHub, RoyalRoad) belong to the main-isolate
+  // browser loop; tell the download isolate to skip them so no chapter is
+  // ever fetched twice at once. On platforms without WebViews (Linux) the
+  // flag stays false and the isolate keeps the old HTTP behaviour.
+  var browserOwnsSites = BrowserFetcher.isSupported;
   exit.listen((_) {
     _downloadManager = null;
     _isolateActive = false;
@@ -88,7 +103,7 @@ void _chapterDownloadManager() async {
   });
   _isolateActive = true;
   _updateActive();
-  var i = await Isolate.spawn((skipScribbleHub) async {
+  var i = await Isolate.spawn((browserOwnsSites) async {
     var db = AppDB(await connection.connect());
     while (true) {
       var l = await db.queuedChapters();
@@ -113,7 +128,7 @@ void _chapterDownloadManager() async {
           await db.setImageData(im.id, await (await client.send(req)).stream.toBytes());
         }
         for (var c in l) {
-          if (isolateSkipsChapter(skipScribbleHub, c.site)) {
+          if (isolateSkipsChapter(browserOwnsSites, c.site)) {
             continue; // owned by the main-isolate browser loop
           }
           var s = sl.firstWhere((s) => s.site == c.site && s.id == c.id);
@@ -185,6 +200,6 @@ void _chapterDownloadManager() async {
       }
       await Future.delayed(backoff);
     }
-  }, skipScribbleHub, errorsAreFatal: true, debugName: "Download Isolate", onExit: exit.sendPort);
+  }, browserOwnsSites, errorsAreFatal: true, debugName: "Download Isolate", onExit: exit.sendPort);
   _downloadManager = i;
 }

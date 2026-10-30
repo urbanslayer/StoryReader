@@ -10,6 +10,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:story_reader/browser_download_loop.dart';
 import 'package:story_reader/db.dart';
+import 'package:story_reader/rr_parse.dart';
 import 'package:story_reader/series_data.dart';
 import 'package:story_reader/sh.dart';
 import 'package:story_reader/sh_toc.dart';
@@ -72,10 +73,23 @@ BrowserQueuedChapter chapter(String id, {String? slugName}) =>
       name: "Chapter $id",
       seriesId: "623932",
       seriesName: slugName ?? "Fixture Series",
+      site: Site.scribbleHub,
+    );
+
+BrowserQueuedChapter rrChapter(String id) => BrowserQueuedChapter(
+      number: 0,
+      chapterID: id,
+      name: "Chapter $id",
+      seriesId: "111",
+      seriesName: "Fixture Tale",
+      site: Site.royalRoad,
     );
 
 String urlFor(String id) =>
     scribbleHubChapterUrl("623932", "Fixture Series", id).toString();
+
+String rrUrlFor(String id) =>
+    royalRoadChapterUrl("111", "Fixture Tale", id, "Chapter $id").toString();
 
 /// A real chapter page that carries the title but no #chp_raw content node
 /// (never parses). Deliberately free of challenge markers.
@@ -95,6 +109,42 @@ void main() {
       BrowserDownloadLoop(fetcher: fetcher, store: store);
 
   group("BrowserDownloadLoop.processChapter", () {
+    test("RoyalRoad chapter: RR URL + RR parser, saved under royalRoad",
+        () async {
+      final c = rrChapter("901");
+      final rrPage =
+          File("test/fixtures/rr_chapter.html").readAsStringSync();
+      final fetcher = FakeFetcher({rrUrlFor("901"): rrPage});
+      final store = FakeStore([c]);
+      final action = await makeLoop(fetcher, store).processChapter(c);
+      expect(action, BrowserChapterAction.saved);
+      expect(fetcher.requested.single.toString(), rrUrlFor("901"),
+          reason: "the loop must fetch the RoyalRoad URL, not the SH one");
+      expect(store.saved, hasLength(1));
+      expect(store.saved.single.$1.site, Site.royalRoad);
+      // The RR parser keeps the queued name and the processed body
+      // (hidden anti-piracy paragraph removed, notes relocated).
+      expect(store.saved.single.$2.name, "Chapter 901");
+      expect(store.saved.single.$2.content, isNotNull);
+      expect(store.saved.single.$2.rawHtml, contains("placeholder corridor"));
+      expect(store.saved.single.$2.rawHtml,
+          isNot(contains("unlawfully taken")));
+    });
+
+    test("RoyalRoad challenge body classifies as blocked, queue intact",
+        () async {
+      final c = rrChapter("902");
+      final challenge =
+          File("test/fixtures/rr_anubis_challenge.html").readAsStringSync();
+      final fetcher = FakeFetcher({rrUrlFor("902"): challenge});
+      final store = FakeStore([c]);
+      final action = await makeLoop(fetcher, store).processChapter(c);
+      expect(action, BrowserChapterAction.blocked);
+      expect(store.saved, isEmpty);
+      expect(store.dequeued, isEmpty);
+    });
+
+
     test("successful fetch parses and saves the chapter", () async {
       final c = chapter("101");
       final fetcher = FakeFetcher({urlFor("101"): goodPage});
@@ -182,12 +232,20 @@ void main() {
   });
 
   group("isolateSkipsChapter (loop hand-off rule)", () {
-    test("isolate skips ScribbleHub only when the browser loop owns it", () {
+    test("isolate skips every browser-owned site while the loop is active",
+        () {
       expect(isolateSkipsChapter(true, Site.scribbleHub), isTrue);
-      expect(isolateSkipsChapter(true, Site.royalRoad), isFalse);
+      expect(isolateSkipsChapter(true, Site.royalRoad), isTrue,
+          reason: "RoyalRoad went Cloudflare-walled in 2026-10: the browser "
+              "loop owns it wherever a WebView exists");
       expect(isolateSkipsChapter(false, Site.scribbleHub), isFalse,
           reason: "no WebView platform: the isolate keeps the HTTP path");
-      expect(isolateSkipsChapter(false, Site.royalRoad), isFalse);
+      expect(isolateSkipsChapter(false, Site.royalRoad), isFalse,
+          reason: "no WebView platform: the isolate keeps the HTTP path");
+    });
+
+    test("browserOwnedSites is exactly the walled sites", () {
+      expect(browserOwnedSites, {Site.scribbleHub, Site.royalRoad});
     });
   });
 

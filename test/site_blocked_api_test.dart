@@ -89,4 +89,35 @@ void main() {
       await expectLater(api.simpleSearch('astral'), throwsA(isA<SiteBlocked>()));
     });
   });
+
+  group('RRAPI throws SiteBlocked on a Cloudflare interstitial (HTTP 403)', () {
+    // Measured 2026-10: royalroad.com answers plain HTTP clients with a
+    // Cloudflare "Just a moment..." 403 (it served an Anubis PoW 200 page
+    // before — both kinds must map to SiteBlocked, with RoyalRoad named).
+    late RRAPI api;
+    setUp(() => api = RRAPI.create(_fakeClient(cloudflare, 403)));
+
+    test('series', () async {
+      await expectLater(
+          api.series('111', 'Alpha One'),
+          throwsA(isA<SiteBlocked>()
+              .having((e) => e.kind, 'kind', BotChallengeKind.cloudflare)
+              .having((e) => e.siteName, 'siteName', 'RoyalRoad')
+              .having((e) => e.statusCode, 'statusCode', 403)
+              .having((e) => e.userMessage, 'userMessage',
+                  'RoyalRoad is asking for a browser check (Cloudflare). Try again later.')));
+    });
+
+    test('simpleSearch', () async {
+      await expectLater(api.simpleSearch('alpha'), throwsA(isA<SiteBlocked>()));
+    });
+
+    test('chapterContents', () async {
+      await expectLater(
+          api.chapterContents(
+              SeriesData(site: Site.royalRoad, id: '111', name: 'Alpha One'),
+              '901', 'Chapter One'),
+          throwsA(isA<SiteBlocked>()));
+    });
+  });
 }

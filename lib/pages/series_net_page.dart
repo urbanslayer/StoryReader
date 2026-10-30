@@ -1,12 +1,14 @@
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:story_reader/browser_fetch.dart';
 import 'package:story_reader/chapter_number.dart';
 import 'package:story_reader/db.dart';
 import 'package:story_reader/download_manager.dart';
 import 'package:story_reader/main.dart';
 import 'package:story_reader/pages/chapter_display.dart';
 import 'package:story_reader/prefs.dart';
+import 'package:story_reader/rr_browser.dart';
 import 'package:story_reader/sh_toc.dart';
 import 'dart:ui' as ui;
 
@@ -126,8 +128,12 @@ class _SeriesNetPageState extends State<SeriesNetPage> {
             .then((cs) => _applyToc(cs.reversed.toList()))
             .onError(_onTocError);
       case Site.royalRoad:
-        req = rrC.series(widget.id, widget.name).then((r) async {
-          var b = r.body!;
+        // RoyalRoad pages are Cloudflare-walled (2026-10): through the
+        // WebView wherever one exists; plain HTTP elsewhere (Linux).
+        var rrFetch = BrowserFetcher.isSupported
+            ? fetchRoyalRoadSeriesViaBrowser(widget.id, widget.name)
+            : rrC.series(widget.id, widget.name).then((r) => r.body!);
+        req = rrFetch.then((b) async {
           var s = b.$1;
           var cl = b.$2;
           var thumbnail = s.thumbnail;

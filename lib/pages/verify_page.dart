@@ -7,7 +7,7 @@ import 'package:story_reader/browser_fetch.dart';
 import 'package:story_reader/sh_toc.dart';
 
 /// Full-screen human-verification screen for an anti-bot challenge
-/// (ScribbleHub / Cloudflare).
+/// (ScribbleHub or RoyalRoad, Cloudflare or Anubis).
 ///
 /// Pushed by the root widget whenever [BrowserFetcher.verificationNeeded]
 /// fires: shows a **visible** WebView on the challenged URL (it shares the
@@ -15,11 +15,15 @@ import 'package:story_reader/sh_toc.dart';
 /// here unblocks the download automatically). When the loaded page stops
 /// looking like a challenge the pending verification is completed and this
 /// route pops; Cancel fails the current fetch with `SiteBlocked` and the
-/// chapter stays queued.
+/// chapter stays queued. [siteName] names the challenged site in the header
+/// text (e.g. "RoyalRoad wants to confirm you're human").
 class VerifyPage extends StatefulWidget {
-  const VerifyPage({super.key, required this.url});
+  const VerifyPage({super.key, required this.url, this.siteName = "The site"});
 
   final Uri url;
+
+  /// Which site demanded the check ("ScribbleHub" / "RoyalRoad").
+  final String siteName;
 
   @override
   State<VerifyPage> createState() => _VerifyPageState();
@@ -92,11 +96,11 @@ class _VerifyPageState extends State<VerifyPage> {
       ),
       body: Column(
         children: [
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 12, 16, 8),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
             child: Text(
-              "ScribbleHub wants to confirm you're human — complete the "
-              "check, the download continues automatically.",
+              "${widget.siteName} wants to confirm you're human — complete "
+              "the check, the download continues automatically.",
               textAlign: TextAlign.center,
             ),
           ),

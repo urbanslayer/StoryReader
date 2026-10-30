@@ -37,6 +37,7 @@ import 'package:story_reader/epub/html_to_xhtml.dart';
 import 'package:story_reader/epub/rich_text_to_xhtml.dart';
 import 'package:story_reader/rich_text_tree.dart';
 import 'package:story_reader/rr.dart';
+import 'package:story_reader/rr_browser.dart';
 import 'package:story_reader/series_data.dart';
 import 'package:story_reader/sh.dart';
 import 'package:story_reader/sh_browser.dart';
@@ -123,8 +124,9 @@ final class ExportResult {
 ///   ([AppDB.nextUnreadChaptersForExport]): unread, not removed upstream,
 ///   including content-less placeholders.
 /// * With [fetchMissing], content-less chapters are downloaded (default
-///   fetcher: ScribbleHub through the WebView on platforms that have one,
-///   else plain HTTP; RoyalRoad plain HTTP) and saved through
+///   fetcher: through the WebView on platforms that have one — ScribbleHub
+///   chapter pages and, since 2026-10, all RoyalRoad pages are Cloudflare-
+///   walled; plain HTTP elsewhere) and saved through
 ///   `saveChapter`, so the library gains them too. A chapter that cannot be
 ///   fetched is skipped and reported in [ExportResult.skippedUnavailable];
 ///   only zero exportable chapters is fatal ([ExportException]).
@@ -333,12 +335,20 @@ Future<ExportResult> exportNextUnread(
 Future<List<ChapterData>?> _defaultFetchToc(Site site, String seriesId, String seriesName) async {
   switch (site) {
     case Site.scribbleHub:
+      // The wi_gettocchp ajax endpoint still answers plain HTTP (see
+      // lib/sh.dart): only chapter *pages* are Cloudflare-walled there.
       final resp = await SHAPI.create().chapters(seriesId);
       final toc = resp.body;
       if (toc == null) return null;
       // SHAPI.chapters is newest-first; reconcileChapters wants ascending.
       return toc.reversed.toList();
     case Site.royalRoad:
+      if (BrowserFetcher.isSupported) {
+        // Cloudflare (since 2026-10): the series page needs the WebView.
+        final (_, toc) =
+            await fetchRoyalRoadSeriesViaBrowser(seriesId, seriesName);
+        return toc;
+      }
       final resp = await RRAPI.create().series(seriesId, seriesName);
       return resp.body?.$2;
   }
@@ -359,6 +369,12 @@ Future<ChapterData> _defaultFetchChapter(Series series, Chapter c) async {
       }
       return body;
     case Site.royalRoad:
+      if (BrowserFetcher.isSupported) {
+        // Cloudflare (since 2026-10): the WebView path is the only one that
+        // passes there.
+        return fetchRoyalRoadChapterViaBrowser(
+            series.id, series.name, c.chapterID, c.name);
+      }
       final resp = await RRAPI.create().chapterContents(data, c.chapterID, c.name);
       final body = resp.body;
       if (body == null || body.content == null) {

@@ -42,6 +42,11 @@ final class SeriesData {
   
   Uint8List? thumbnail;
 
+  /// Source URL of [thumbnail] as found on the page. HTML parsers fill this
+  /// in (they never do network I/O); the HTTP/WebView layers then fetch the
+  /// bytes into [thumbnail] when images are enabled.
+  String? thumbnailUrl;
+
   SeriesData(
       {required this.site,
       this.name = "",
@@ -54,7 +59,8 @@ final class SeriesData {
       this.favourites = 0,
       this.follows = 0,
       this.ratings = 0,
-      this.thumbnail});
+      this.thumbnail,
+      this.thumbnailUrl});
 
   @override
   String toString() {

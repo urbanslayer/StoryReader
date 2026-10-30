@@ -48,7 +48,9 @@ final router = GoRouter(routes: [
   GoRoute(path: "/update", pageBuilder: (c, s) => MaterialPage(child: UpdatePage())),
   GoRoute(path: "/verify", pageBuilder: (c, s) {
     var e = s.extra as Map<String, dynamic>;
-    return MaterialPage(child: VerifyPage(url: Uri.parse(e["url"] as String)));
+    return MaterialPage(child: VerifyPage(
+        url: Uri.parse(e["url"] as String),
+        siteName: (e["site"] as String?) ?? "The site"));
   })
 ], restorationScopeId: "router");
 
@@ -120,18 +122,19 @@ class _MainAppState extends State<MainApp> {
     super.dispose();
   }
 
-  /// The browser fetcher publishes the challenged URL here; show the
-  /// human-verification screen wherever the app currently is (the download
-  /// continues automatically when the user finishes the check).
+  /// The browser fetcher publishes the challenged URL and site here; show
+  /// the human-verification screen wherever the app currently is (the
+  /// download continues automatically when the user finishes the check).
   void _onVerificationNeeded() {
-    var url = BrowserFetcher.instance.verificationNeeded.value;
-    if (url == null || _verifyOpen) {
+    var pending = BrowserFetcher.instance.verificationNeeded.value;
+    if (pending == null || _verifyOpen) {
       return;
     }
     _verifyOpen = true;
     // Wait for the first frame so the router has a navigator to push onto.
     WidgetsBinding.instance.addPostFrameCallback((_) async {
-      await router.push("/verify", extra: {"url": url.toString()});
+      await router.push("/verify",
+          extra: {"url": pending.url.toString(), "site": pending.siteName});
       _verifyOpen = false;
     });
   }

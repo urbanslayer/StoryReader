@@ -1,12 +1,14 @@
 // WebView-backed HTML fetcher for pages that no non-browser client can load
 // (ScribbleHub chapter pages sit behind a Cloudflare managed challenge that
-// 403s every dart:io/curl request, 2026-10). One reused [HeadlessInAppWebView]
-// loads the page with the default WebView User-Agent (deliberately *not*
-// overridden), waits for the JS challenge to clear itself, and returns the
-// rendered DOM. If the challenge demands a human, a verification request is
-// published on [verificationNeeded]; `lib/pages/verify_page.dart` shows the
-// page to the user and completes the request via [completeVerification] /
-// [cancelVerification].
+// 403s every dart:io/curl request, and since 2026-10 every royalroad.com
+// page — search, series and chapter — is Cloudflare-walled too; 2026-10).
+// One reused [HeadlessInAppWebView] loads the page with the default WebView
+// User-Agent (deliberately *not* overridden), waits for the JS challenge to
+// clear itself, and returns the rendered DOM. If the challenge demands a
+// human, a verification request (URL + site name, so the screen can say
+// which site is asking) is published on [verificationNeeded];
+// `lib/pages/verify_page.dart` shows the page to the user and completes the
+// request via [completeVerification] / [cancelVerification].
 //
 // Cookie continuity (why this works against Cloudflare): on Android the
 // plugin drives the platform `android.webkit.CookieManager`, which is a
@@ -26,6 +28,24 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import 'package:story_reader/browser_download_loop.dart';
 import 'package:story_reader/sh_toc.dart';
+
+/// A pending human-verification request: which URL is challenged and which
+/// site produced it (so the verification screen can name the right one).
+final class BrowserVerification {
+  final Uri url;
+  final String siteName;
+
+  const BrowserVerification(this.url, this.siteName);
+}
+
+/// Whether a challenged URL belongs to a known site; the name the
+/// verification screen and [SiteBlocked] carry.
+String browserSiteNameFor(Uri url) {
+  final host = url.host.toLowerCase();
+  if (host.contains("royalroad")) return "RoyalRoad";
+  if (host.contains("scribblehub")) return "ScribbleHub";
+  return "The site";
+}
 
 /// Singleton [HtmlFetcher] backed by one reused [HeadlessInAppWebView].
 ///
@@ -67,10 +87,12 @@ final class BrowserFetcher implements HtmlFetcher {
   /// Poll interval while waiting for the page to become ready.
   static const Duration pollInterval = Duration(seconds: 1);
 
-  /// Set to the challenged URL while a human verification is pending, null
-  /// otherwise. The root widget listens for this and shows the verification
-  /// screen; only one verification is ever in flight (fetches are serialised).
-  final ValueNotifier<Uri?> verificationNeeded = ValueNotifier<Uri?>(null);
+  /// Set to the pending request (challenged URL + site name) while a human
+  /// verification is pending, null otherwise. The root widget listens for
+  /// this and shows the verification screen; only one verification is ever
+  /// in flight (fetches are serialised).
+  final ValueNotifier<BrowserVerification?> verificationNeeded =
+      ValueNotifier<BrowserVerification?>(null);
 
   HeadlessInAppWebView? _headless;
   InAppWebViewController? _controller;
@@ -152,7 +174,7 @@ final class BrowserFetcher implements HtmlFetcher {
   SiteBlocked _blocked(Uri url, String html) => SiteBlocked(
         url.toString(),
         kind: botChallengeKind(null, html) ?? BotChallengeKind.cloudflare,
-        siteName: "ScribbleHub",
+        siteName: browserSiteNameFor(url),
       );
 
   // ---- verification hand-off -------------------------------------------
@@ -161,7 +183,7 @@ final class BrowserFetcher implements HtmlFetcher {
     assert(_verification == null, "fetches are serialised: one at a time");
     final c = Completer<bool>();
     _verification = c;
-    verificationNeeded.value = url;
+    verificationNeeded.value = BrowserVerification(url, browserSiteNameFor(url));
     bool solved;
     try {
       solved = await c.future.timeout(verificationWindow,
